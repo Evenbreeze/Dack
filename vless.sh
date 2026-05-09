@@ -247,10 +247,11 @@ show_banner() {
 ensure_ssh_port_open() {
     echo -e "${YELLOW}${BOLD}${ICON_SHIELD} 检测当前 SSH 端口...${NC}"
     
-    # 自动检测当前正在使用的 SSH 端口
-    CURRENT_SSH_PORT=$(ss -ltnp | grep -oP 'sshd.*:\K\d+' | head -n1)
+    # 更准确的检测方式
+    CURRENT_SSH_PORT=$(ss -ltnp | grep sshd | awk '{print $4}' | cut -d: -f2 | head -n1)
+    [[ -z "$CURRENT_SSH_PORT" ]] && CURRENT_SSH_PORT=$(ps -ef | grep sshd | grep -oP 'port \K\d+' | head -n1)
     [[ -z "$CURRENT_SSH_PORT" ]] && CURRENT_SSH_PORT=22
-    
+
     echo -e "${GREEN}✅ 检测到当前 SSH 端口：${YELLOW}${CURRENT_SSH_PORT}${NC}"
     
     echo -e "${CYAN}${BOLD}请输入 SSH 端口 [留空直接回车 = 使用当前 ${CURRENT_SSH_PORT}]：${NC}"
@@ -263,7 +264,7 @@ ensure_ssh_port_open() {
         SSH_PORT=$CUSTOM_SSH
         echo -e "${GREEN}→ 使用自定义 SSH 端口：${SSH_PORT}${NC}"
     fi
-    
+
     # 开放防火墙
     if command -v ufw >/dev/null 2>&1; then
         ufw allow ${SSH_PORT}/tcp >/dev/null 2>&1
