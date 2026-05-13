@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Debian 12+：编译 3proxy，多公网 IP SOCKS5（连哪个 IP+端口，就从哪个 IP 出）。
 #
-# 【两种方式】① 无 endpoints.conf：直接运行脚本，先按提示一条条输入 公网IP:端口 ，
-#              空行结束；再问 SOCKS5 用户名、密码（输两遍）。
+# 【两种方式】① 无 endpoints.conf：运行脚本 → 选多行粘贴(m)或逐条输入 → 账号口令。
+#              批量粘贴：每行 IP:端口，最后单独一行 END 回车。
 #            ② 同目录放好 endpoints.conf：每行 公网IP:端口 ，不要写密码；运行脚本后只问账号口令。
 #
-# 【运行】chmod +x install.sh && sudo bash install.sh
+# 【运行】cd 到脚本所在目录后： chmod +x install.sh && sudo bash install.sh
+#        （若用管道/curl 等方式运行，当前目录会用来放 endpoints.conf）
 #
 # 【可选】sudo -E env SOCKS_USER='x' SOCKS_PASS='y' bash install.sh
 #        ENDPOINTS_FILE=/path/to/列表.conf bash install.sh
@@ -21,7 +22,22 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 脚本从管道/stdin 运行时路径常为 /dev/fd/*、/dev/stdin、- ，无法用「脚本所在目录」
+_script_src="${BASH_SOURCE[0]}"
+if [[ "$_script_src" == /dev/fd/* || "$_script_src" == /proc/self/fd/* || "$_script_src" == /dev/stdin || "$_script_src" == "-" ]]; then
+  SCRIPT_DIR="$(pwd -P)"
+else
+  SCRIPT_DIR="$(cd "$(dirname "$_script_src")" && pwd -P)"
+fi
+# bash < install.sh 时 dirname 可能是 /dev
+if [[ "$(dirname "$_script_src")" == /dev ]]; then
+  SCRIPT_DIR="$(pwd -P)"
+fi
+if [[ "$SCRIPT_DIR" == /dev/fd || "$SCRIPT_DIR" == /dev/fd/* ]]; then
+  SCRIPT_DIR="$(pwd -P)"
+fi
+unset _script_src
+
 INTERACTIVE_TMP=""
 LOCAL_EP="$SCRIPT_DIR/endpoints.conf"
 
@@ -35,24 +51,54 @@ elif [[ -f "$LOCAL_EP" ]]; then
   ENDPOINTS="$LOCAL_EP"
 else
   echo ""
-  echo "未找到同目录下的 endpoints.conf ，下面在终端里一条一条输入。"
-  echo "格式：公网IP:端口（中间英文冒号）    例：203.0.113.1:8443"
-  echo "全部输完后，**再单独按一次回车（空行）**表示结束。"
-  echo ""
+  echo "未找到同目录下的 endpoints.conf 。"
+  echo "格式：每行 公网IP:端口（中间英文冒号）"
+  read -r -p "多行一起粘贴请输入 m 回车；一条条输入请直接回车: " bulk
   INTERACTIVE_TMP=$(mktemp)
   n=0
-  while true; do
-    read -r -p "[$((n + 1))] 公网IP:端口（空行结束）: " line || true
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    [[ -z "$line" ]] && break
-    if [[ "$line" != *:* ]]; then
-      echo "  → 格式不对，需要带一个冒号，比如 1.2.3.4:8443 ，请重输这一条。" >&2
-      continue
-    fi
-    echo "$line" >>"$INTERACTIVE_TMP"
-    n=$((n + 1))
-  done
+  _trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    s="${s//$'\r'/}"
+    printf '%s' "$s"
+  }
+
+  if [[ "${bulk:-}" =~ ^[mM]$ ]]; then
+    echo ""
+    echo "请粘贴多行（每行一组），以 # 开头的行会忽略。"
+    echo "全部粘贴完后，**单独起一行**输入 END 再回车结束。"
+    echo ""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="$(_trim "$line")"
+      [[ -z "$line" ]] && continue
+      [[ "$line" == \#* ]] && continue
+      if [[ "${line^^}" == "END" ]]; then
+        break
+      fi
+      if [[ "$line" != *:* ]]; then
+        echo "  → 跳过无效行（需含冒号）: $line" >&2
+        continue
+      fi
+      echo "$line" >>"$INTERACTIVE_TMP"
+      n=$((n + 1))
+    done
+  else
+    echo "逐条输入；**仅回车（空行）**表示结束。"
+    echo ""
+    while true; do
+      read -r -p "[$((n + 1))] 公网IP:端口（空行结束）: " line || true
+      line="$(_trim "$line")"
+      [[ -z "$line" ]] && break
+      if [[ "$line" != *:* ]]; then
+        echo "  → 格式不对，需要带一个冒号，比如 1.2.3.4:8443 ，请重输这一条。" >&2
+        continue
+      fi
+      echo "$line" >>"$INTERACTIVE_TMP"
+      n=$((n + 1))
+    done
+  fi
+
   if [[ "$n" -eq 0 ]]; then
     echo "至少输入一组 IP:端口" >&2
     rm -f "$INTERACTIVE_TMP"
@@ -60,7 +106,7 @@ else
   fi
   ENDPOINTS="$INTERACTIVE_TMP"
   trap "rm -f '$INTERACTIVE_TMP'" EXIT
-  read -r -p "把刚输入的列表保存成 endpoints.conf 方便下次？[y/N] " save_ep
+  read -r -p "把列表保存成 endpoints.conf 方便下次？[y/N] " save_ep
   if [[ "${save_ep:-}" =~ ^[yY] ]]; then
     cp "$INTERACTIVE_TMP" "$LOCAL_EP"
     chmod 600 "$LOCAL_EP"
