@@ -2,7 +2,7 @@
 # Debian 12+：编译 3proxy，多公网 IP SOCKS5（连哪个 IP+端口，就从哪个 IP 出）。
 #
 # 【两种方式】① 无 endpoints.conf：运行脚本 → 默认多行粘贴（回车即可）；输入 n 则逐条 → 账号口令。
-#              批量粘贴：每行 IP:端口（中间不要空行）；贴完后按一次回车结束。
+#              批量粘贴：每行 IPv4:端口（中间不要空行）；贴完后按一次回车结束。
 #            ② 同目录放好 endpoints.conf：每行 公网IP:端口 ，不要写密码；运行脚本后只问账号口令。
 #
 # 【运行】cd 到脚本所在目录后： chmod +x install.sh && sudo bash install.sh
@@ -10,6 +10,8 @@
 #        （若用 bash <(curl ...) 等方式运行，当前目录会用来放 endpoints.conf）
 #
 # 【可选】sudo -E env SOCKS_USER='x' SOCKS_PASS='y' bash install.sh
+#        密码无法粘贴时可用上一行，避免屏幕上显示口令。
+#        需要恢复「输入不显示」：SOCKS_PASS_HIDDEN=1 bash install.sh
 #        ENDPOINTS_FILE=/path/to/列表.conf bash install.sh
 #
 # 【上传仓库前】git status 里不要出现 endpoints.conf；不放心就把仓库设 Private。
@@ -25,6 +27,18 @@ read_tty() {
   else
     read -r "$@"
   fi
+}
+
+# 校验 endpoints 一行：仅支持 IPv4:端口（端口 1–65535）
+_valid_ep_line() {
+  local ip port
+  port="${1##*:}"
+  ip="${1%%:*}"
+  [[ -n "$ip" && -n "$port" && "$ip" != "$1" ]] || return 1
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  [[ "$port" -ge 1 && "$port" -le 65535 ]] || return 1
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  return 0
 }
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -62,7 +76,7 @@ elif [[ -f "$LOCAL_EP" ]]; then
 else
   echo ""
   echo "未找到同目录下的 endpoints.conf 。"
-  echo "格式：每行 公网IP:端口（中间英文冒号）"
+  echo "格式：每行 IPv4:端口（中间英文冒号，端口 1–65535）"
   read_tty -p "多行粘贴请直接回车；逐条输入请输入 n 回车: " bulk
   INTERACTIVE_TMP=$(mktemp)
   n=0
@@ -82,21 +96,21 @@ else
       read_tty -p "[$((n + 1))] 公网IP:端口（空行结束）: " line || true
       line="$(_trim "$line")"
       [[ -z "$line" ]] && break
-      if [[ "$line" != *:* ]]; then
-        echo "  → 格式不对，需要带一个冒号，比如 1.2.3.4:8443 ，请重输这一条。" >&2
+      if ! _valid_ep_line "$line"; then
+        echo "  → 格式须为 IPv4:端口（端口 1–65535），例如 1.2.3.4:8443 ，请重输。" >&2
         continue
       fi
       echo "$line" >>"$INTERACTIVE_TMP"
       n=$((n + 1))
     done
   else
-    # 有人把第一行 IP:端口 粘在「回车/n」提示同一行，别丢掉
-    if [[ -n "$bulk_trim" && "$bulk_trim" == *:* && "$bulk_trim" != \#* ]]; then
+    # 有人把第一行 IPv4:端口 粘在「回车/n」提示同一行，别丢掉（须过校验）
+    if [[ -n "$bulk_trim" && "$bulk_trim" != \#* ]] && _valid_ep_line "$bulk_trim"; then
       echo "$bulk_trim" >>"$INTERACTIVE_TMP"
       n=$((n + 1))
     fi
     echo ""
-    echo "请粘贴：每行 公网IP:端口；条目之间不要空行。"
+    echo "请粘贴：每行 IPv4:端口；条目之间不要空行。"
     echo "以 # 开头的行会忽略。贴完后按**一次回车**结束。"
     echo ""
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -106,8 +120,8 @@ else
         continue
       fi
       [[ "$line" == \#* ]] && continue
-      if [[ "$line" != *:* ]]; then
-        echo "  → 跳过无效行（需含冒号）: $line" >&2
+      if ! _valid_ep_line "$line"; then
+        echo "  → 跳过无效行（须 IPv4:端口）: $line" >&2
         continue
       fi
       echo "$line" >>"$INTERACTIVE_TMP"
@@ -121,7 +135,8 @@ else
     exit 1
   fi
   ENDPOINTS="$INTERACTIVE_TMP"
-  trap "rm -f '$INTERACTIVE_TMP'" EXIT
+  _itmp_rm() { [[ -n "${INTERACTIVE_TMP:-}" && -f "${INTERACTIVE_TMP:-}" ]] && rm -f -- "$INTERACTIVE_TMP"; }
+  trap '_itmp_rm' EXIT
   read_tty -p "把列表保存成 endpoints.conf 方便下次？[y/N] " save_ep
   if [[ "${save_ep:-}" =~ ^[yY] ]]; then
     cp "$INTERACTIVE_TMP" "$LOCAL_EP"
@@ -139,12 +154,24 @@ if [[ -z "${SOCKS_USER// /}" ]]; then
   echo "用户名不能为空" >&2
   exit 1
 fi
+if [[ "$SOCKS_USER" == *:* || "$SOCKS_USER" == *' '* || "$SOCKS_USER" == *$'\t'* ]]; then
+  echo "用户名不能含空格、制表符或英文冒号（与 3proxy 配置格式冲突）" >&2
+  exit 1
+fi
 
 if [[ -z "${SOCKS_PASS:-}" ]]; then
-  read_tty -s -p "SOCKS5 密码: " SOCKS_PASS
-  echo
-  read_tty -s -p "再输入一次密码: " SOCKS_PASS2
-  echo
+  if [[ -n "${SOCKS_PASS_HIDDEN:-}" ]]; then
+    read_tty -s -p "SOCKS5 密码: " SOCKS_PASS
+    echo
+    read_tty -s -p "再输入一次密码: " SOCKS_PASS2
+    echo
+  else
+    echo "口令输入：因不少 SSH/终端在「隐藏输入」(read -s) 下无法粘贴，此处改为可见输入；输完可自行执行 clear。"
+    echo "若更介意屏幕留痕，请 Ctrl+C 后在同一条安装命令前加上：env SOCKS_PASS='...' （勿把密码写进脚本文件再上传）。"
+    echo ""
+    read_tty -p "SOCKS5 密码: " SOCKS_PASS
+    read_tty -p "再输入一次密码: " SOCKS_PASS2
+  fi
   if [[ "$SOCKS_PASS" != "$SOCKS_PASS2" ]]; then
     echo "两次密码不一致" >&2
     exit 1
@@ -154,6 +181,10 @@ if [[ -z "$SOCKS_PASS" ]]; then
   echo "密码不能为空" >&2
   exit 1
 fi
+if [[ "$SOCKS_PASS" == *:* ]]; then
+  echo "密码不能含英文冒号 :（3proxy users 行会用冒号分段）" >&2
+  exit 1
+fi
 
 EP_COUNT=0
 declare -a FIRST_LINE
@@ -161,8 +192,8 @@ while IFS= read -r _line || [[ -n "$_line" ]]; do
   _line="${_line#"${_line%%[![:space:]]*}"}"
   _line="${_line%"${_line##*[![:space:]]}"}"
   [[ -z "$_line" || "$_line" == \#* ]] && continue
-  if [[ "$_line" != *:* ]]; then
-    echo "无效行（需  IP:端口）: $_line" >&2
+  if ! _valid_ep_line "$_line"; then
+    echo "无效行（须 IPv4:端口，端口 1–65535）: $_line" >&2
     exit 1
   fi
   EP_COUNT=$((EP_COUNT + 1))
@@ -177,6 +208,11 @@ fi
 FIRST_EP="${FIRST_LINE[0]:-}"
 CURL_IP="${FIRST_EP%%:*}"
 CURL_PORT="${FIRST_EP##*:}"
+
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "未找到 apt-get，本脚本仅适用于 Debian/Ubuntu 系。" >&2
+  exit 1
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
@@ -193,28 +229,24 @@ install -m 755 bin/3proxy /usr/local/bin/3proxy
 
 install -d -m 755 /etc/3proxy
 umask 077
-# users: CL = 明文密码；须与 allow 同一用户名（区分大小写）
+# users: CL = 明文；须与 allow 同名。口令含 $、` 等时不能用未引用 heredoc 拼进配置，故用 printf 写入。
 {
-  cat <<PART
+  cat <<'PART'
 daemon
 maxconn 500
 nserver 8.8.8.8
 nscache 65536
 pidfile /var/run/3proxy.pid
 
-users ${SOCKS_USER}:CL:${SOCKS_PASS}
-
-auth strong
-allow ${SOCKS_USER}
-
 PART
+  printf 'users %s:CL:%s\n\nauth strong\nallow %s\n\n' "$SOCKS_USER" "$SOCKS_PASS" "$SOCKS_USER"
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
     ip="${line%%:*}"
     port="${line##*:}"
-    echo "socks -p${port} -i${ip} -e${ip}"
+    printf 'socks -p%s -i%s -e%s\n' "$port" "$ip" "$ip"
   done <"$ENDPOINTS"
 } >/etc/3proxy/3proxy.cfg
 chmod 600 /etc/3proxy/3proxy.cfg
@@ -258,7 +290,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line#"${line%%[![:space:]]*}"}"
   line="${line%"${line##*[![:space:]]}"}"
   [[ -z "$line" || "$line" == \#* ]] && continue
-  echo "${line}:${SOCKS_USER}:${SOCKS_PASS}" >>"$CLIENT_LIST"
+  printf '%s:%s:%s\n' "$line" "$SOCKS_USER" "$SOCKS_PASS" >>"$CLIENT_LIST"
 done <"$ENDPOINTS"
 chmod 600 "$CLIENT_LIST"
 
