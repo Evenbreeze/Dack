@@ -6,7 +6,8 @@
 #            ② 同目录放好 endpoints.conf：每行 公网IP:端口 ，不要写密码；运行脚本后只问账号口令。
 #
 # 【运行】cd 到脚本所在目录后： chmod +x install.sh && sudo bash install.sh
-#        （若用管道/curl 等方式运行，当前目录会用来放 endpoints.conf）
+#        socks5.sh 与 install.sh 相同，可推到 GitHub 给 curl 一键装。
+#        （若用 bash <(curl ...) 等方式运行，当前目录会用来放 endpoints.conf）
 #
 # 【可选】sudo -E env SOCKS_USER='x' SOCKS_PASS='y' bash install.sh
 #        ENDPOINTS_FILE=/path/to/列表.conf bash install.sh
@@ -73,7 +74,8 @@ else
     printf '%s' "$s"
   }
 
-  if [[ "${bulk:-}" =~ ^[nN]$ ]]; then
+  bulk_trim="$(_trim "${bulk:-}")"
+  if [[ "$bulk_trim" =~ ^[nN]$ ]]; then
     echo "逐条输入；**仅回车（空行）**表示结束。"
     echo ""
     while true; do
@@ -88,6 +90,11 @@ else
       n=$((n + 1))
     done
   else
+    # 有人把第一行 IP:端口 粘在「回车/n」提示同一行，别丢掉
+    if [[ -n "$bulk_trim" && "$bulk_trim" == *:* && "$bulk_trim" != \#* ]]; then
+      echo "$bulk_trim" >>"$INTERACTIVE_TMP"
+      n=$((n + 1))
+    fi
     echo ""
     echo "请粘贴：每行 公网IP:端口；条目之间不要空行。"
     echo "以 # 开头的行会忽略。贴完后按**一次回车**结束。"
