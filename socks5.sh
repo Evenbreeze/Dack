@@ -2,7 +2,7 @@
 # Debian 12+：编译 3proxy，多公网 IP SOCKS5（连哪个 IP+端口，就从哪个 IP 出）。
 #
 # 【两种方式】① 无 endpoints.conf：运行脚本 → 默认多行粘贴（回车即可）；输入 n 则逐条 → 账号口令。
-#              批量粘贴：每行 IP:端口，最后单独一行 END 回车。
+#              批量粘贴：每行 IP:端口；结束后连按两次回车，或单独一行 END 回车。
 #            ② 同目录放好 endpoints.conf：每行 公网IP:端口 ，不要写密码；运行脚本后只问账号口令。
 #
 # 【运行】cd 到脚本所在目录后： chmod +x install.sh && sudo bash install.sh
@@ -90,11 +90,20 @@ else
   else
     echo ""
     echo "请粘贴多行（每行一组），以 # 开头的行会忽略。"
-    echo "全部粘贴完后，**单独起一行**输入 END 再回车结束。"
+    echo "粘贴结束后：**连按两次回车**（两个空行）结束；或单独一行输入 END 再回车。"
+    echo "（单写一个空行不算结束，这样你可以在条目之间留空行。）"
     echo ""
+    empty_run=0
     while IFS= read -r line || [[ -n "$line" ]]; do
       line="$(_trim "$line")"
-      [[ -z "$line" ]] && continue
+      if [[ -z "$line" ]]; then
+        empty_run=$((empty_run + 1))
+        if [[ "$empty_run" -ge 2 && "$n" -gt 0 ]]; then
+          break
+        fi
+        continue
+      fi
+      empty_run=0
       [[ "$line" == \#* ]] && continue
       if [[ "${line^^}" == "END" ]]; then
         break
