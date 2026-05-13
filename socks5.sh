@@ -10,7 +10,7 @@
 #        （若用 bash <(curl ...) 等方式运行，当前目录会用来放 endpoints.conf）
 #
 # 【可选】sudo -E env SOCKS_USER='x' SOCKS_PASS='y' bash install.sh
-#        密码无法粘贴时可用上一行，避免屏幕上显示口令。
+#        粘贴仍异常时可在命令前设置 SOCKS_PASS（或改用 Windows 终端 / MobaXterm 等）。
 #        需要恢复「输入不显示」：SOCKS_PASS_HIDDEN=1 bash install.sh
 #        ENDPOINTS_FILE=/path/to/列表.conf bash install.sh
 #
@@ -26,6 +26,15 @@ read_tty() {
     read -r "$@" </dev/tty
   else
     read -r "$@"
+  fi
+}
+
+# 带 readline（-e）：多数终端里右键/Ctrl+Shift+V 粘贴更可靠；用户名、明文口令等用它
+read_tty_edit() {
+  if [[ -r /dev/tty ]]; then
+    read -e -r "$@" </dev/tty
+  else
+    read -e -r "$@"
   fi
 }
 
@@ -77,7 +86,7 @@ else
   echo ""
   echo "未找到同目录下的 endpoints.conf 。"
   echo "格式：每行 IPv4:端口（中间英文冒号，端口 1–65535）"
-  read_tty -p "多行粘贴请直接回车；逐条输入请输入 n 回车: " bulk
+  read_tty_edit -p "多行粘贴请直接回车；逐条输入请输入 n 回车: " bulk
   INTERACTIVE_TMP=$(mktemp)
   n=0
   _trim() {
@@ -93,7 +102,7 @@ else
     echo "逐条输入；**仅回车（空行）**表示结束。"
     echo ""
     while true; do
-      read_tty -p "[$((n + 1))] 公网IP:端口（空行结束）: " line || true
+      read_tty_edit -p "[$((n + 1))] 公网IP:端口（空行结束）: " line || true
       line="$(_trim "$line")"
       [[ -z "$line" ]] && break
       if ! _valid_ep_line "$line"; then
@@ -137,7 +146,7 @@ else
   ENDPOINTS="$INTERACTIVE_TMP"
   _itmp_rm() { [[ -n "${INTERACTIVE_TMP:-}" && -f "${INTERACTIVE_TMP:-}" ]] && rm -f -- "$INTERACTIVE_TMP"; }
   trap '_itmp_rm' EXIT
-  read_tty -p "把列表保存成 endpoints.conf 方便下次？[y/N] " save_ep
+  read_tty_edit -p "把列表保存成 endpoints.conf 方便下次？[y/N] " save_ep
   if [[ "${save_ep:-}" =~ ^[yY] ]]; then
     cp "$INTERACTIVE_TMP" "$LOCAL_EP"
     chmod 600 "$LOCAL_EP"
@@ -148,7 +157,7 @@ fi
 
 # ---------- 账号口令：按提示输入（或用环境变量 SOCKS_USER / SOCKS_PASS）----------
 if [[ -z "${SOCKS_USER:-}" ]]; then
-  read_tty -p "SOCKS5 用户名: " SOCKS_USER
+  read_tty_edit -p "SOCKS5 用户名: " SOCKS_USER
 fi
 if [[ -z "${SOCKS_USER// /}" ]]; then
   echo "用户名不能为空" >&2
@@ -161,16 +170,16 @@ fi
 
 if [[ -z "${SOCKS_PASS:-}" ]]; then
   if [[ -n "${SOCKS_PASS_HIDDEN:-}" ]]; then
-    read_tty -s -p "SOCKS5 密码: " SOCKS_PASS
+    read_tty_edit -s -p "SOCKS5 密码: " SOCKS_PASS
     echo
-    read_tty -s -p "再输入一次密码: " SOCKS_PASS2
+    read_tty_edit -s -p "再输入一次密码: " SOCKS_PASS2
     echo
   else
-    echo "口令输入：因不少 SSH/终端在「隐藏输入」(read -s) 下无法粘贴，此处改为可见输入；输完可自行执行 clear。"
+    echo "口令输入（已启用 readline，一般可用 Ctrl+Shift+V / 右键粘贴；若无反应请用环境变量 SOCKS_PASS）："
     echo "若更介意屏幕留痕，请 Ctrl+C 后在同一条安装命令前加上：env SOCKS_PASS='...' （勿把密码写进脚本文件再上传）。"
     echo ""
-    read_tty -p "SOCKS5 密码: " SOCKS_PASS
-    read_tty -p "再输入一次密码: " SOCKS_PASS2
+    read_tty_edit -p "SOCKS5 密码: " SOCKS_PASS
+    read_tty_edit -p "再输入一次密码: " SOCKS_PASS2
   fi
   if [[ "$SOCKS_PASS" != "$SOCKS_PASS2" ]]; then
     echo "两次密码不一致" >&2
@@ -187,7 +196,7 @@ if [[ "$SOCKS_PASS" == *:* ]]; then
 fi
 
 EP_COUNT=0
-declare -a FIRST_LINE
+FIRST_EP_LINE=""
 while IFS= read -r _line || [[ -n "$_line" ]]; do
   _line="${_line#"${_line%%[![:space:]]*}"}"
   _line="${_line%"${_line##*[![:space:]]}"}"
@@ -197,7 +206,7 @@ while IFS= read -r _line || [[ -n "$_line" ]]; do
     exit 1
   fi
   EP_COUNT=$((EP_COUNT + 1))
-  [[ ${#FIRST_LINE[@]} -eq 0 ]] && FIRST_LINE=("${_line}")
+  [[ -z "${FIRST_EP_LINE:-}" ]] && FIRST_EP_LINE="$_line"
 done <"$ENDPOINTS"
 
 if [[ "$EP_COUNT" -eq 0 ]]; then
@@ -205,7 +214,7 @@ if [[ "$EP_COUNT" -eq 0 ]]; then
   exit 1
 fi
 
-FIRST_EP="${FIRST_LINE[0]:-}"
+FIRST_EP="$FIRST_EP_LINE"
 CURL_IP="${FIRST_EP%%:*}"
 CURL_PORT="${FIRST_EP##*:}"
 
