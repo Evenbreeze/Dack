@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Debian 12+：编译 3proxy，多公网 IP SOCKS5（连哪个 IP+端口，就从哪个 IP 出）。
 #
-# 【两种方式】① 无 endpoints.conf：运行脚本 → 选多行粘贴(m)或逐条输入 → 账号口令。
+# 【两种方式】① 无 endpoints.conf：运行脚本 → 默认多行粘贴（回车即可）；输入 n 则逐条 → 账号口令。
 #              批量粘贴：每行 IP:端口，最后单独一行 END 回车。
 #            ② 同目录放好 endpoints.conf：每行 公网IP:端口 ，不要写密码；运行脚本后只问账号口令。
 #
@@ -16,6 +16,15 @@
 # 前置：ip -4 addr 已能见到列表里全部 IP；云防火墙放行所列 TCP 端口及 SSH。
 
 set -euo pipefail
+
+# curl|bash 时 stdin 是脚本内容，交互必须从终端读
+read_tty() {
+  if [[ -r /dev/tty ]]; then
+    read -r "$@" </dev/tty
+  else
+    read -r "$@"
+  fi
+}
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "请用 root: sudo bash $0" >&2
@@ -53,7 +62,7 @@ else
   echo ""
   echo "未找到同目录下的 endpoints.conf 。"
   echo "格式：每行 公网IP:端口（中间英文冒号）"
-  read -r -p "多行一起粘贴请输入 m 回车；一条条输入请直接回车: " bulk
+  read_tty -p "多行粘贴请直接回车；逐条输入请输入 n 回车: " bulk
   INTERACTIVE_TMP=$(mktemp)
   n=0
   _trim() {
@@ -64,7 +73,21 @@ else
     printf '%s' "$s"
   }
 
-  if [[ "${bulk:-}" =~ ^[mM]$ ]]; then
+  if [[ "${bulk:-}" =~ ^[nN]$ ]]; then
+    echo "逐条输入；**仅回车（空行）**表示结束。"
+    echo ""
+    while true; do
+      read_tty -p "[$((n + 1))] 公网IP:端口（空行结束）: " line || true
+      line="$(_trim "$line")"
+      [[ -z "$line" ]] && break
+      if [[ "$line" != *:* ]]; then
+        echo "  → 格式不对，需要带一个冒号，比如 1.2.3.4:8443 ，请重输这一条。" >&2
+        continue
+      fi
+      echo "$line" >>"$INTERACTIVE_TMP"
+      n=$((n + 1))
+    done
+  else
     echo ""
     echo "请粘贴多行（每行一组），以 # 开头的行会忽略。"
     echo "全部粘贴完后，**单独起一行**输入 END 再回车结束。"
@@ -82,21 +105,7 @@ else
       fi
       echo "$line" >>"$INTERACTIVE_TMP"
       n=$((n + 1))
-    done
-  else
-    echo "逐条输入；**仅回车（空行）**表示结束。"
-    echo ""
-    while true; do
-      read -r -p "[$((n + 1))] 公网IP:端口（空行结束）: " line || true
-      line="$(_trim "$line")"
-      [[ -z "$line" ]] && break
-      if [[ "$line" != *:* ]]; then
-        echo "  → 格式不对，需要带一个冒号，比如 1.2.3.4:8443 ，请重输这一条。" >&2
-        continue
-      fi
-      echo "$line" >>"$INTERACTIVE_TMP"
-      n=$((n + 1))
-    done
+    done </dev/tty
   fi
 
   if [[ "$n" -eq 0 ]]; then
@@ -106,7 +115,7 @@ else
   fi
   ENDPOINTS="$INTERACTIVE_TMP"
   trap "rm -f '$INTERACTIVE_TMP'" EXIT
-  read -r -p "把列表保存成 endpoints.conf 方便下次？[y/N] " save_ep
+  read_tty -p "把列表保存成 endpoints.conf 方便下次？[y/N] " save_ep
   if [[ "${save_ep:-}" =~ ^[yY] ]]; then
     cp "$INTERACTIVE_TMP" "$LOCAL_EP"
     chmod 600 "$LOCAL_EP"
@@ -117,7 +126,7 @@ fi
 
 # ---------- 账号口令：按提示输入（或用环境变量 SOCKS_USER / SOCKS_PASS）----------
 if [[ -z "${SOCKS_USER:-}" ]]; then
-  read -r -p "SOCKS5 用户名: " SOCKS_USER
+  read_tty -p "SOCKS5 用户名: " SOCKS_USER
 fi
 if [[ -z "${SOCKS_USER// /}" ]]; then
   echo "用户名不能为空" >&2
@@ -125,9 +134,9 @@ if [[ -z "${SOCKS_USER// /}" ]]; then
 fi
 
 if [[ -z "${SOCKS_PASS:-}" ]]; then
-  read -r -s -p "SOCKS5 密码: " SOCKS_PASS
+  read_tty -s -p "SOCKS5 密码: " SOCKS_PASS
   echo
-  read -r -s -p "再输入一次密码: " SOCKS_PASS2
+  read_tty -s -p "再输入一次密码: " SOCKS_PASS2
   echo
   if [[ "$SOCKS_PASS" != "$SOCKS_PASS2" ]]; then
     echo "两次密码不一致" >&2
