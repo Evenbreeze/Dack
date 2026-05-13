@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# Debian 12+：编译 3proxy，多公网 IP SOCKS5（连哪个 IP+端口，就从哪个 IP 出）。
+#
+# 【两种方式】① 无 endpoints.conf：直接运行脚本，先按提示一条条输入 公网IP:端口 ，
+#              空行结束；再问 SOCKS5 用户名、密码（输两遍）。
+#            ② 同目录放好 endpoints.conf：每行 公网IP:端口 ，不要写密码；运行脚本后只问账号口令。
+#
+# 【运行】chmod +x install.sh && sudo bash install.sh
+#
+# 【可选】sudo -E env SOCKS_USER='x' SOCKS_PASS='y' bash install.sh
+#        ENDPOINTS_FILE=/path/to/列表.conf bash install.sh
+#
+# 【上传仓库前】git status 里不要出现 endpoints.conf；不放心就把仓库设 Private。
+#
+# 前置：ip -4 addr 已能见到列表里全部 IP；云防火墙放行所列 TCP 端口及 SSH。
+
+set -euo pipefail
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "请用 root: sudo bash $0" >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INTERACTIVE_TMP=""
+LOCAL_EP="$SCRIPT_DIR/endpoints.conf"
+
+if [[ -n "${ENDPOINTS_FILE:-}" ]]; then
+  ENDPOINTS="$ENDPOINTS_FILE"
+  if [[ ! -f "$ENDPOINTS" ]]; then
+    echo "未找到 ENDPOINTS_FILE: $ENDPOINTS" >&2
+    exit 1
+  fi
+elif [[ -f "$LOCAL_EP" ]]; then
+  ENDPOINTS="$LOCAL_EP"
+else
+  echo ""
+  echo "未找到同目录下的 endpoints.conf ，下面在终端里一条一条输入。"
+  echo "格式：公网IP:端口（中间英文冒号）    例：203.0.113.1:8443"
+  echo "全部输完后，**再单独按一次回车（空行）**表示结束。"
+  echo ""
+  INTERACTIVE_TMP=$(mktemp)
+  n=0
+  while true; do
+    read -r -p "[$((n + 1))] 公网IP:端口（空行结束）: " line || true
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && break
+    if [[ "$line" != *:* ]]; then
+      echo "  → 格式不对，需要带一个冒号，比如 1.2.3.4:8443 ，请重输这一条。" >&2
+      continue
+    fi
+    echo "$line" >>"$INTERACTIVE_TMP"
+    n=$((n + 1))
+  done
+  if [[ "$n" -eq 0 ]]; then
+    echo "至少输入一组 IP:端口" >&2
+    rm -f "$INTERACTIVE_TMP"
+    exit 1
+  fi
+  ENDPOINTS="$INTERACTIVE_TMP"
+  trap "rm -f '$INTERACTIVE_TMP'" EXIT
+  read -r -p "把刚输入的列表保存成 endpoints.conf 方便下次？[y/N] " save_ep
+  if [[ "${save_ep:-}" =~ ^[yY] ]]; then
+    cp "$INTERACTIVE_TMP" "$LOCAL_EP"
+    chmod 600 "$LOCAL_EP"
+    echo "已保存: $LOCAL_EP（勿上传 Git）"
+  fi
+  echo ""
+fi
+
+# ---------- 账号口令：按提示输入（或用环境变量 SOCKS_USER / SOCKS_PASS）----------
+if [[ -z "${SOCKS_USER:-}" ]]; then
+  read -r -p "SOCKS5 用户名: " SOCKS_USER
+fi
+if [[ -z "${SOCKS_USER// /}" ]]; then
+  echo "用户名不能为空" >&2
+  exit 1
+fi
+
+if [[ -z "${SOCKS_PASS:-}" ]]; then
+  read -r -s -p "SOCKS5 密码: " SOCKS_PASS
+  echo
+  read -r -s -p "再输入一次密码: " SOCKS_PASS2
+  echo
+  if [[ "$SOCKS_PASS" != "$SOCKS_PASS2" ]]; then
+    echo "两次密码不一致" >&2
+    exit 1
+  fi
+fi
+if [[ -z "$SOCKS_PASS" ]]; then
+  echo "密码不能为空" >&2
+  exit 1
+fi
+
+EP_COUNT=0
+declare -a FIRST_LINE
+while IFS= read -r _line || [[ -n "$_line" ]]; do
+  _line="${_line#"${_line%%[![:space:]]*}"}"
+  _line="${_line%"${_line##*[![:space:]]}"}"
+  [[ -z "$_line" || "$_line" == \#* ]] && continue
+  if [[ "$_line" != *:* ]]; then
+    echo "无效行（需  IP:端口）: $_line" >&2
+    exit 1
+  fi
+  EP_COUNT=$((EP_COUNT + 1))
+  [[ ${#FIRST_LINE[@]} -eq 0 ]] && FIRST_LINE=("${_line}")
+done <"$ENDPOINTS"
+
+if [[ "$EP_COUNT" -eq 0 ]]; then
+  echo "endpoints.conf 无有效 IP:端口 行" >&2
+  exit 1
+fi
+
+FIRST_EP="${FIRST_LINE[0]:-}"
+CURL_IP="${FIRST_EP%%:*}"
+CURL_PORT="${FIRST_EP##*:}"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y build-essential wget
+
+_3VER=0.9.6
+cd /tmp
+rm -rf "3proxy-${_3VER}"*
+wget -O "3proxy-${_3VER}.tar.gz" "https://github.com/3proxy/3proxy/archive/refs/tags/${_3VER}.tar.gz"
+tar xzf "3proxy-${_3VER}.tar.gz"
+cd "3proxy-${_3VER}"
+make -f Makefile.Linux
+install -m 755 bin/3proxy /usr/local/bin/3proxy
+
+install -d -m 755 /etc/3proxy
+umask 077
+# users: CL = 明文密码；须与 allow 同一用户名（区分大小写）
+{
+  cat <<PART
+daemon
+maxconn 500
+nserver 8.8.8.8
+nscache 65536
+pidfile /var/run/3proxy.pid
+
+users ${SOCKS_USER}:CL:${SOCKS_PASS}
+
+auth strong
+allow ${SOCKS_USER}
+
+PART
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    ip="${line%%:*}"
+    port="${line##*:}"
+    echo "socks -p${port} -i${ip} -e${ip}"
+  done <"$ENDPOINTS"
+} >/etc/3proxy/3proxy.cfg
+chmod 600 /etc/3proxy/3proxy.cfg
+chown root:root /etc/3proxy/3proxy.cfg
+umask 022
+
+killall danted 2>/dev/null || true
+
+cat >/etc/systemd/system/3proxy-local.service <<'UNIT'
+[Unit]
+Description=3proxy (local /usr/local/bin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/3proxy.pid
+ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now 3proxy-local
+sleep 2
+
+echo
+echo "======== 自检 ========"
+systemctl status 3proxy-local --no-pager || true
+echo -n "3proxy 监听行数(应为 $EP_COUNT): "
+ss -tlnp 2>/dev/null | grep -c 3proxy || echo "0"
+echo "====================="
+
+CLIENT_LIST=/root/3proxy-socks-clients.txt
+umask 077
+: >"$CLIENT_LIST"
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  [[ -z "$line" || "$line" == \#* ]] && continue
+  echo "${line}:${SOCKS_USER}:${SOCKS_PASS}" >>"$CLIENT_LIST"
+done <"$ENDPOINTS"
+chmod 600 "$CLIENT_LIST"
+
+echo
+echo "客户端列表（含口令）: $CLIENT_LIST"
+echo "本机测 SOCKS（勿用 127.0.0.1；首行为 endpoints.conf 第一组地址）："
+echo "  curl -x socks5h://${SOCKS_USER}:'<密码>'@${CURL_IP}:${CURL_PORT} --connect-timeout 10 https://ipinfo.io/ip"
+echo
+echo "改配置后: systemctl restart 3proxy-local"
