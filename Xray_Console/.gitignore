@@ -1,7 +1,0 @@
-node_modules/
-data.db
-admin.config.json
-cert.pem
-key.pem
-*.log
-.env
