@@ -3,7 +3,22 @@
 const fs   = require('fs');
 const { execSync, spawnSync } = require('child_process');
 
-const XRAY_CONFIG = '/usr/local/etc/xray/config.json';
+// Try multiple common Xray config locations
+const XRAY_CONFIG_CANDIDATES = [
+  '/usr/local/etc/xray/config.json',
+  '/etc/xray/config.json',
+  '/opt/xray/config.json',
+  '/usr/local/etc/xray/conf/config.json',
+];
+
+function findXrayConfig() {
+  for (const p of XRAY_CONFIG_CANDIDATES) {
+    if (fs.existsSync(p)) return p;
+  }
+  return XRAY_CONFIG_CANDIDATES[0]; // fallback
+}
+
+const XRAY_CONFIG = findXrayConfig();
 const ACCESS_LOG  = '/var/log/xray/access.log';
 const XRAY_API    = '127.0.0.1:10085';
 // Online threshold: active within 5 minutes counts as online
@@ -263,6 +278,7 @@ function buildVlessLink(uuid, remark, cfg, serverIp) {
 module.exports = {
   readConfig, writeConfig, reloadXray,
   addClient, removeClient, updateClientEmail,
+  getClients,
   enableStats, queryTrafficStats,
   getOnlineEmails, buildVlessLink,
   XRAY_CONFIG,
