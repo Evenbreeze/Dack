@@ -193,7 +193,11 @@ async function main() {
         const email    = u.remark || u.uuid.slice(0, 8);
         const isOnline = online.has(email);
         const ips      = onlineIps[email] || [];
-        if (isOnline) users.touchSeen(u.uuid);
+        if (isOnline) {
+          users.touchSeen(u.uuid);
+          // Persist the most recent IP so it's visible when offline later
+          if (ips.length > 0) users.update(u.id, { last_ip: ips[ips.length - 1] });
+        }
         const logTs = lastSeen[email];
         return {
           ...u,
