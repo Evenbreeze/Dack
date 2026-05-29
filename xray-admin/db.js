@@ -17,7 +17,8 @@ db.exec(`
     traffic_used  INTEGER DEFAULT 0,
     expires_at    DATETIME,
     created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
-    last_seen     DATETIME
+    last_seen     DATETIME,
+    last_ip       TEXT    DEFAULT ''
   );
 
   CREATE TABLE IF NOT EXISTS settings (
@@ -27,10 +28,11 @@ db.exec(`
 `);
 
 // Migrations for existing databases
-try { db.exec('ALTER TABLE users ADD COLUMN expires_at DATETIME'); }         catch {}
-try { db.exec('ALTER TABLE users ADD COLUMN max_ips INTEGER DEFAULT 1'); }   catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN expires_at DATETIME'); }             catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN max_ips INTEGER DEFAULT 1'); }       catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN traffic_limit INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN traffic_used INTEGER DEFAULT 0'); }  catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_ip TEXT DEFAULT ''"); }         catch {}
 
 const users = {
   all() {
@@ -52,7 +54,7 @@ const users = {
     const allowed = [
       'remark', 'note', 'status', 'max_ips',
       'traffic_limit', 'traffic_used',
-      'last_seen', 'expires_at',
+      'last_seen', 'last_ip', 'expires_at',
     ];
     const fields = Object.keys(data).filter(k => allowed.includes(k));
     if (!fields.length) return users.byId(id);
