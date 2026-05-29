@@ -371,9 +371,6 @@ function showApp() {
   switchTab('users');
   loadUsers();
   loadSettings();
-  // Clear any existing timer before creating a new one (prevents duplicates on re-login)
-  if (_refreshTimer) clearInterval(_refreshTimer);
-  _refreshTimer = setInterval(loadUsers, 30000);
 }
 
 /* ─────────────────────────── Tabs ──────────────────────────── */
@@ -624,7 +621,7 @@ async function syncFromXray() {
   try {
     toast('正在从 Xray 读取用户...', 'info');
     const d = await api('POST', '/api/sync-xray');
-    toast(`同步完成：新导入 ${d.imported} 个，已存在 ${d.skipped} 个`, 'success');
+    toast(`同步完成：新导入 ${d.imported} 个，更新别名 ${d.updated} 个，已跳过 ${d.skipped} 个`, 'success');
     await loadUsers();
   } catch (e) { toast('同步失败: ' + e.message, 'error'); }
 }
