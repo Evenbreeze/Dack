@@ -114,13 +114,11 @@ async function main() {
   const BASE = cfg.adminPath;
 
   app.use(express.json());
-  app.use(BASE, express.static(path.join(__dirname, 'public'), { index: false }));
+  // Serve static files; index.html auto-detects BASE from URL — no replacement needed
+  app.use(BASE, express.static(path.join(__dirname, 'public')));
 
   function serveIndex(res) {
-    const html = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8')
-      .replace('%%ADMIN_PATH%%', BASE);
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(html);
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
   }
 
   /* ── Session store (24-hour expiry) ── */
