@@ -20,8 +20,8 @@ INSTALL_DIR="/opt/xray-admin"
 SERVICE_FILE="/etc/systemd/system/xray-admin.service"
 
 # ─── 获取仓库地址 ─────────────────────────────
-REPO_URL="${XRAY_ADMIN_REPO:-https://github.com/YOUR_GITHUB_USERNAME/xray-admin}"
-RAW_URL="${REPO_URL/github.com/raw.githubusercontent.com}/main"
+REPO_URL="${XRAY_ADMIN_REPO:-https://github.com/Evenbreeze/Dack}"
+RAW_URL="${REPO_URL/github.com/raw.githubusercontent.com}/main/xray-admin"
 
 echo ""
 echo -e "${BOLD}══════════════════════════════════════════${NC}"
