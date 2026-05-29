@@ -465,20 +465,27 @@ function renderTable() {
       </div>`;
     }
 
-    // Device / IP count display
+    // Device / IP display
     const ips      = u.onlineIps || [];
     const ipCount  = ips.length;
     const maxIps   = u.max_ips || 0;
     const exceeded = maxIps > 0 && ipCount > maxIps;
-    const ipTip    = ips.length ? ips.join(', ') : '无';
     let deviceHtml;
     if (!u.isOnline) {
-      deviceHtml = `<span class="text-slate-600 text-xs">离线</span>`;
+      // Offline: show last known IP (dimmed) if available
+      const lastIp = u.last_ip || '';
+      deviceHtml = lastIp
+        ? `<div class="text-xs"><span class="text-slate-600">离线</span><br><span class="text-slate-700 font-mono">${lastIp}</span></div>`
+        : `<span class="text-slate-600 text-xs">离线</span>`;
     } else if (exceeded) {
-      deviceHtml = `<span class="text-red-400 font-semibold" title="${ipTip}">⚠️ ${ipCount}/${maxIps}</span>`;
+      // Over limit: show all IPs in red
+      const ipList = ips.map(ip => `<span class="font-mono">${ip}</span>`).join('<br>');
+      deviceHtml = `<div class="text-xs text-red-400">⚠️ ${ipCount}/${maxIps}<br>${ipList}</div>`;
     } else {
-      const label = maxIps > 0 ? `${ipCount}/${maxIps}` : `${ipCount}`;
-      deviceHtml = `<span class="text-green-400 text-xs" title="${ipTip}">${label}</span>`;
+      // Normal online: show IPs in green
+      const label  = maxIps > 0 ? `🟢 ${ipCount}/${maxIps}` : `🟢 ${ipCount}`;
+      const ipList = ips.map(ip => `<span class="font-mono">${ip}</span>`).join('<br>');
+      deviceHtml = `<div class="text-xs text-green-400">${label}<br>${ipList}</div>`;
     }
 
     // Expiry display
