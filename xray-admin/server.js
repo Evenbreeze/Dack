@@ -286,6 +286,37 @@ async function main() {
     }
   });
 
+  /* Sync users from Xray config into DB */
+  app.post(`${BASE}/api/sync-xray`, auth, (req, res) => {
+    try {
+      const xcfg    = xray.readConfig();
+      const clients = xray.getClients(xcfg);
+      const imported = [];
+      const skipped  = [];
+
+      for (const c of clients) {
+        // Skip the API inbound client (tag: api)
+        if (!c.id) continue;
+
+        const existing = users.byId && users.all().find(u => u.uuid === c.id);
+        if (existing) {
+          skipped.push(c.id);
+          continue;
+        }
+
+        // Import: use email as remark, fallback to first 8 chars of uuid
+        const remark = c.email || c.id.slice(0, 8);
+        let user = users.create(c.id, remark);
+        users.update(user.id, { status: 'approved' });
+        imported.push({ uuid: c.id, remark });
+      }
+
+      res.json({ ok: true, imported: imported.length, skipped: skipped.length, details: imported });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   /* Reset a user's traffic counter */
   app.post(`${BASE}/api/users/:id/reset-traffic`, auth, (req, res) => {
     try {
