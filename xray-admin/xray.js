@@ -5,10 +5,10 @@ const { execSync, spawnSync } = require('child_process');
 
 // Try multiple common Xray config locations
 const XRAY_CONFIG_CANDIDATES = [
-  '/usr/local/etc/xray/config.json',
-  '/etc/xray/config.json',
-  '/opt/xray/config.json',
+  '/etc/xray/config.json',              // vless.sh 默认路径
+  '/usr/local/etc/xray/config.json',    // Xray 官方安装默认路径
   '/usr/local/etc/xray/conf/config.json',
+  '/opt/xray/config.json',
 ];
 
 function findXrayConfig() {
