@@ -19,7 +19,7 @@
 > 将下方命令中 `YOUR_GITHUB_USERNAME` 替换为你的 GitHub 用户名后运行
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/xray-admin/main/install.sh)
+bash <(curl -s https://raw.githubusercontent.com/Evenbreeze/Dack/main/xray-admin/install.sh)
 ```
 
 安装过程会引导你设置：
@@ -38,7 +38,7 @@ curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y nodejs
 
 # 2. 下载项目
-git clone https://github.com/YOUR_GITHUB_USERNAME/xray-admin.git /opt/xray-admin
+git clone https://github.com/Evenbreeze/Dack.git /tmp/Dack && cp -r /tmp/Dack/xray-admin /opt/xray-admin
 cd /opt/xray-admin
 
 # 3. 安装依赖
