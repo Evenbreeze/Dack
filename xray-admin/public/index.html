@@ -54,11 +54,11 @@
     <div class="space-y-4">
       <div>
         <label class="text-sm text-slate-400 block mb-1">用户名</label>
-        <input id="loginUser" type="text" placeholder="admin" autocomplete="username" />
+        <input id="loginUser" type="text" placeholder="" autocomplete="username" />
       </div>
       <div>
         <label class="text-sm text-slate-400 block mb-1">密码</label>
-        <input id="loginPass" type="password" placeholder="••••••••" autocomplete="current-password"
+        <input id="loginPass" type="password" placeholder="" autocomplete="current-password"
                onkeydown="if(event.key==='Enter') doLogin()" />
       </div>
       <button class="btn btn-primary w-full mt-2" onclick="doLogin()">登 录</button>
@@ -322,8 +322,9 @@
 
 <script>
 /* ─────────────────────────── State ─────────────────────────── */
-// BASE is injected by the server at render time (replaces %%ADMIN_PATH%%)
-const BASE  = '%%ADMIN_PATH%%';
+// Auto-detect BASE from current URL — no server-side injection needed.
+// e.g. https://IP:PORT/a3b69784afd0e8b5/ → BASE = '/a3b69784afd0e8b5'
+const BASE  = window.location.pathname.split('/').slice(0, 2).join('/');
 let TOKEN   = localStorage.getItem('xa_token') || '';
 let allUsers = [];
 let _refreshTimer = null;
