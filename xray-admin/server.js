@@ -9,7 +9,7 @@ const crypto     = require('crypto');
 const readline   = require('readline');
 const { spawnSync } = require('child_process');
 
-const { users } = require('./db');
+const { users, ipBlocks } = require('./db');
 const xray = require('./xray');
 
 const CFG_FILE = path.join(__dirname, 'admin.config.json');
@@ -189,20 +189,39 @@ async function main() {
       const list = users.all();
       const { online, lastSeen, onlineIps } = xray.getOnlineEmails();
 
+      // Get the full set of blocked IPs from Xray routing + DB
+      let xrayBlockedIps = [];
+      try {
+        const xcfg = xray.readConfig();
+        xrayBlockedIps = xray.getBlockedSourceIps(xcfg);
+      } catch {}
+
       const result = list.map(u => {
         const email    = u.remark || u.uuid.slice(0, 8);
         const isOnline = online.has(email);
         const ips      = onlineIps[email] || [];
         if (isOnline) {
           users.touchSeen(u.uuid);
-          // Persist the most recent IP so it's visible when offline later
           if (ips.length > 0) users.update(u.id, { last_ip: ips[ips.length - 1] });
         }
         const logTs = lastSeen[email];
+
+        // Mark each online IP as blocked or not
+        const onlineIpDetails = ips.map(ip => ({
+          ip,
+          blocked: xrayBlockedIps.includes(ip),
+        }));
+
+        // Also include IPs that are IP-blocked for this user but not currently online
+        const dbBlockedIps = ipBlocks.byUserId(u.id)
+          .filter(b => !ips.includes(b.ip))
+          .map(b => ({ ip: b.ip, blocked: true, offline: true }));
+
         return {
           ...u,
           isOnline,
-          onlineIps: ips,
+          onlineIpDetails,
+          blockedOfflineIps: dbBlockedIps,
           last_seen: isOnline ? new Date().toISOString()
                    : logTs    ? new Date(logTs).toISOString()
                    : u.last_seen,
@@ -382,6 +401,44 @@ async function main() {
       const user = users.byId(req.params.id);
       if (!user) return res.status(404).json({ error: '用户不存在' });
       res.json(users.update(user.id, { traffic_used: 0 }));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  /* Block a specific IP (not the whole UUID) */
+  app.post(`${BASE}/api/users/:id/block-ip`, auth, (req, res) => {
+    try {
+      const { ip } = req.body || {};
+      if (!ip) return res.status(400).json({ error: '缺少 IP 参数' });
+      const user = users.byId(req.params.id);
+      if (!user) return res.status(404).json({ error: '用户不存在' });
+
+      const xcfg = xray.readConfig();
+      xray.blockSourceIp(xcfg, ip);
+      xray.writeConfig(xcfg);
+      ipBlocks.block(ip, user.id);
+
+      res.json({ ok: true });
+      setImmediate(() => { try { xray.reloadXray(); } catch {} });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  /* Unblock a specific IP */
+  app.post(`${BASE}/api/users/:id/unblock-ip`, auth, (req, res) => {
+    try {
+      const { ip } = req.body || {};
+      if (!ip) return res.status(400).json({ error: '缺少 IP 参数' });
+
+      const xcfg = xray.readConfig();
+      xray.unblockSourceIp(xcfg, ip);
+      xray.writeConfig(xcfg);
+      ipBlocks.unblock(ip);
+
+      res.json({ ok: true });
+      setImmediate(() => { try { xray.reloadXray(); } catch {} });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
