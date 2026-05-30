@@ -518,7 +518,7 @@ function renderTable() {
           : `<span class="text-slate-600 text-xs">离线</span>`;
 
       const timeHtml = ipd.lastSeen
-        ? `<span class="text-slate-500 text-xs">${timeAgo(ipd.lastSeen)}</span>`
+        ? `<span class="text-slate-500 text-xs">${formatDateTime(ipd.lastSeen)}</span>`
         : `<span class="text-slate-700 text-xs">未知</span>`;
 
       const actionHtml = ipd.blocked
@@ -793,13 +793,15 @@ function toast(msg, type = 'info') {
   toastTimer = setTimeout(() => el.classList.add('hidden'), 3000);
 }
 
-function timeAgo(isoStr) {
+function formatDateTime(isoStr) {
   if (!isoStr) return '—';
-  const diff = Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000);
-  if (diff < 60)   return `${diff}秒前`;
-  if (diff < 3600) return `${Math.floor(diff/60)}分钟前`;
-  if (diff < 86400) return `${Math.floor(diff/3600)}小时前`;
-  return `${Math.floor(diff/86400)}天前`;
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) return '—';
+  return d.toLocaleString('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  });
 }
 
 function escHtml(s) {
