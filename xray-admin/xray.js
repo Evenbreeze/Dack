@@ -184,18 +184,19 @@ function queryTrafficStats() {
 /* ─── Online detection (log parse) ──────────────────── */
 
 function getOnlineEmails() {
-  const online    = new Set();
-  const lastSeen  = {};   // email → epoch ms
-  const onlineIps = {};   // email → Set<ip>
+  const online      = new Set();
+  const lastSeen    = {};   // email → epoch ms (most recent activity)
+  const onlineIps   = {};   // email → Set<ip> (active last 5 min)
+  const allIpTimes  = {};   // email → { ip → lastSeenMs } (full history in log)
 
-  if (!fs.existsSync(ACCESS_LOG)) return { online, lastSeen, onlineIps: {} };
+  if (!fs.existsSync(ACCESS_LOG)) return { online, lastSeen, onlineIps: {}, allIpTimes: {} };
 
   let tail = '';
   try {
     tail = execSync(`tail -n 3000 "${ACCESS_LOG}"`, {
       encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'],
     });
-  } catch { return { online, lastSeen, onlineIps: {} }; }
+  } catch { return { online, lastSeen, onlineIps: {}, allIpTimes: {} }; }
 
   const now = Date.now();
 
@@ -213,6 +214,14 @@ function getOnlineEmails() {
 
     if (!lastSeen[email] || lastSeen[email] < ts) lastSeen[email] = ts;
 
+    if (ip) {
+      // Track every IP with its most recent timestamp (full log history)
+      if (!allIpTimes[email]) allIpTimes[email] = {};
+      if (!allIpTimes[email][ip] || allIpTimes[email][ip] < ts) {
+        allIpTimes[email][ip] = ts;
+      }
+    }
+
     if (now - ts < ONLINE_MS) {
       online.add(email);
       if (ip) {
@@ -222,10 +231,18 @@ function getOnlineEmails() {
     }
   }
 
-  const result = {};
-  for (const [k, v] of Object.entries(onlineIps)) result[k] = [...v];
+  const onlineIpsResult = {};
+  for (const [k, v] of Object.entries(onlineIps)) onlineIpsResult[k] = [...v];
 
-  return { online, lastSeen, onlineIps: result };
+  // Convert allIpTimes → sorted [{ip, lastSeen}] per email
+  const allIpTimesResult = {};
+  for (const [email, ipMap] of Object.entries(allIpTimes)) {
+    allIpTimesResult[email] = Object.entries(ipMap)
+      .map(([ip, ts]) => ({ ip, lastSeen: ts }))
+      .sort((a, b) => b.lastSeen - a.lastSeen);
+  }
+
+  return { online, lastSeen, onlineIps: onlineIpsResult, allIpTimes: allIpTimesResult };
 }
 
 /* ─── VLESS link generator ───────────────────────────── */
