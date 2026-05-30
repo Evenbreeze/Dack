@@ -197,33 +197,40 @@ async function main() {
       } catch {}
 
       const result = list.map(u => {
-        const email    = u.remark || u.uuid.slice(0, 8);
-        const isOnline = online.has(email);
-        const ips      = onlineIps[email] || [];
+        const email       = u.remark || u.uuid.slice(0, 8);
+        const isOnline    = online.has(email);
+        const onlineIpSet = new Set(onlineIps[email] || []);
+        const logIps      = allIpTimes[email] || []; // [{ip, lastSeen}] sorted desc
+
         if (isOnline) {
           users.touchSeen(u.uuid);
-          if (ips.length > 0) users.update(u.id, { last_ip: ips[ips.length - 1] });
+          const firstIp = logIps.find(x => onlineIpSet.has(x.ip));
+          if (firstIp) users.update(u.id, { last_ip: firstIp.ip });
         }
-        const logTs = lastSeen[email];
 
-        // Mark each online IP as blocked or not
-        const onlineIpDetails = ips.map(ip => ({
-          ip,
-          blocked: xrayBlockedIps.includes(ip),
-        }));
+        // Merge log IPs + DB-blocked IPs (from db but not in log)
+        const seenInLog = new Set(logIps.map(x => x.ip));
+        const dbOnlyBlocked = ipBlocks.byUserId(u.id)
+          .filter(b => !seenInLog.has(b.ip))
+          .map(b => ({ ip: b.ip, lastSeen: null, isOnline: false, blocked: true }));
 
-        // Also include IPs that are IP-blocked for this user but not currently online
-        const dbBlockedIps = ipBlocks.byUserId(u.id)
-          .filter(b => !ips.includes(b.ip))
-          .map(b => ({ ip: b.ip, blocked: true, offline: true }));
+        const allIpDetails = [
+          ...logIps.map(({ ip, lastSeen: ts }) => ({
+            ip,
+            lastSeen:  ts ? new Date(ts).toISOString() : null,
+            isOnline:  onlineIpSet.has(ip),
+            blocked:   xrayBlockedIps.includes(ip),
+          })),
+          ...dbOnlyBlocked,
+        ];
 
         return {
           ...u,
           isOnline,
-          onlineIpDetails,
-          blockedOfflineIps: dbBlockedIps,
+          allIpDetails,
+          // Keep last_seen for internal use (not shown in main row)
           last_seen: isOnline ? new Date().toISOString()
-                   : logTs    ? new Date(logTs).toISOString()
+                   : lastSeen[email] ? new Date(lastSeen[email]).toISOString()
                    : u.last_seen,
         };
       });
