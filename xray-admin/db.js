@@ -25,6 +25,14 @@ db.exec(`
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT ''
   );
+
+  CREATE TABLE IF NOT EXISTS ip_blocks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip         TEXT    UNIQUE NOT NULL,
+    user_id    INTEGER,
+    note       TEXT    DEFAULT '',
+    blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 // Migrations for existing databases
@@ -44,9 +52,7 @@ const users = {
   },
 
   create(uuid, remark) {
-    const r = db.prepare(
-      'INSERT INTO users (uuid, remark) VALUES (?, ?)'
-    ).run(uuid, remark || '');
+    const r = db.prepare('INSERT INTO users (uuid, remark) VALUES (?, ?)').run(uuid, remark || '');
     return users.byId(r.lastInsertRowid);
   },
 
@@ -65,35 +71,52 @@ const users = {
   },
 
   touchSeen(uuid) {
-    db.prepare(
-      "UPDATE users SET last_seen = datetime('now') WHERE uuid = ?"
-    ).run(uuid);
+    db.prepare("UPDATE users SET last_seen = datetime('now') WHERE uuid = ?").run(uuid);
   },
 
   remove(id) {
     db.prepare('DELETE FROM users WHERE id = ?').run(id);
   },
 
-  // Approved users whose expiry time has passed
   getExpired() {
     return db.prepare(
       "SELECT * FROM users WHERE status = 'approved' AND expires_at IS NOT NULL AND expires_at <= datetime('now')"
     ).all();
   },
 
-  // Approved users with a traffic quota set
   getTrafficLimited() {
     return db.prepare(
       "SELECT * FROM users WHERE status = 'approved' AND traffic_limit > 0"
     ).all();
   },
 
-  // All approved users (used by IP limit checker)
   getApproved() {
-    return db.prepare(
-      "SELECT * FROM users WHERE status = 'approved'"
-    ).all();
+    return db.prepare("SELECT * FROM users WHERE status = 'approved'").all();
   },
 };
 
-module.exports = { users };
+const ipBlocks = {
+  all() {
+    return db.prepare('SELECT * FROM ip_blocks ORDER BY blocked_at DESC').all();
+  },
+
+  isBlocked(ip) {
+    return !!db.prepare('SELECT id FROM ip_blocks WHERE ip = ?').get(ip);
+  },
+
+  block(ip, userId) {
+    try {
+      db.prepare('INSERT INTO ip_blocks (ip, user_id) VALUES (?, ?)').run(ip, userId || null);
+    } catch {} // ignore duplicate
+  },
+
+  unblock(ip) {
+    db.prepare('DELETE FROM ip_blocks WHERE ip = ?').run(ip);
+  },
+
+  byUserId(userId) {
+    return db.prepare('SELECT * FROM ip_blocks WHERE user_id = ?').all(userId);
+  },
+};
+
+module.exports = { users, ipBlocks };
