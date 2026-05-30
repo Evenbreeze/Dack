@@ -465,27 +465,30 @@ function renderTable() {
       </div>`;
     }
 
-    // Device / IP display
-    const ips      = u.onlineIps || [];
-    const ipCount  = ips.length;
-    const maxIps   = u.max_ips || 0;
-    const exceeded = maxIps > 0 && ipCount > maxIps;
+    // Device column: clickable to expand IP list
+    const ipDetails = u.onlineIpDetails || [];
+    const ipCount   = ipDetails.length;
+    const maxIps    = u.max_ips || 0;
+    const exceeded  = maxIps > 0 && ipCount > maxIps;
+    const lastIp    = u.last_ip || '';
+    const hasIps    = ipCount > 0 || (u.blockedOfflineIps || []).length > 0 || lastIp;
     let deviceHtml;
     if (!u.isOnline) {
-      // Offline: show last known IP (dimmed) if available
-      const lastIp = u.last_ip || '';
       deviceHtml = lastIp
-        ? `<div class="text-xs"><span class="text-slate-600">离线</span><br><span class="text-slate-700 font-mono">${lastIp}</span></div>`
+        ? `<button onclick="toggleIps(${u.id})" class="text-left">
+             <div class="text-slate-600 text-xs">离线</div>
+             <div class="text-slate-700 font-mono text-xs">${lastIp}</div>
+           </button>`
         : `<span class="text-slate-600 text-xs">离线</span>`;
     } else if (exceeded) {
-      // Over limit: show all IPs in red
-      const ipList = ips.map(ip => `<span class="font-mono">${ip}</span>`).join('<br>');
-      deviceHtml = `<div class="text-xs text-red-400">⚠️ ${ipCount}/${maxIps}<br>${ipList}</div>`;
+      deviceHtml = `<button onclick="toggleIps(${u.id})" class="text-red-400 text-xs font-semibold">
+        ⚠️ ${ipCount}/${maxIps} 个 ▾
+      </button>`;
     } else {
-      // Normal online: show IPs in green
-      const label  = maxIps > 0 ? `🟢 ${ipCount}/${maxIps}` : `🟢 ${ipCount}`;
-      const ipList = ips.map(ip => `<span class="font-mono">${ip}</span>`).join('<br>');
-      deviceHtml = `<div class="text-xs text-green-400">${label}<br>${ipList}</div>`;
+      const label = maxIps > 0 ? `${ipCount}/${maxIps}` : `${ipCount}`;
+      deviceHtml = `<button onclick="toggleIps(${u.id})" class="text-green-400 text-xs">
+        🟢 ${label} 个在线 ▾
+      </button>`;
     }
 
     // Expiry display
@@ -508,6 +511,38 @@ function renderTable() {
       blockBtn = `<button onclick="unblockUser(${u.id})" class="text-green-400 hover:text-green-300 text-xs transition-colors" title="解除拉黑">✅ 解黑</button>`;
     }
     // expired: no block/unblock — admin edits duration to renew
+
+    // IP sub-rows (hidden by default, toggled on click)
+    const allIpRows = [];
+    for (const ipd of ipDetails) {
+      allIpRows.push(`<tr class="ip-subrow hidden bg-slate-900" data-user="${u.id}">
+        <td colspan="2" class="pl-10 py-2 font-mono text-xs text-slate-300">↳ ${ipd.ip}</td>
+        <td class="py-2 text-xs">
+          ${ipd.blocked
+            ? `<span class="badge bg-red-900 text-red-300">已拉黑</span>`
+            : '<span class="text-green-400 text-xs">在线</span>'}
+        </td>
+        <td class="py-2 text-xs text-slate-500">在线中</td>
+        <td colspan="3" class="py-2"></td>
+        <td class="py-2 pr-4 text-right">
+          ${ipd.blocked
+            ? `<button onclick="unblockIp(${u.id},'${ipd.ip}')" class="text-green-400 hover:text-green-300 text-xs">✅ 解除</button>`
+            : `<button onclick="blockIp(${u.id},'${ipd.ip}')" class="text-red-400 hover:text-red-300 text-xs">🚫 拉黑此IP</button>`}
+        </td>
+      </tr>`);
+    }
+    // Also show IP-blocked offline IPs for this user
+    for (const bip of (u.blockedOfflineIps || [])) {
+      allIpRows.push(`<tr class="ip-subrow hidden bg-slate-900" data-user="${u.id}">
+        <td colspan="2" class="pl-10 py-2 font-mono text-xs text-slate-500">↳ ${bip.ip}</td>
+        <td class="py-2 text-xs"><span class="badge bg-red-900 text-red-300">已拉黑</span></td>
+        <td class="py-2 text-xs text-slate-600">离线</td>
+        <td colspan="3" class="py-2"></td>
+        <td class="py-2 pr-4 text-right">
+          <button onclick="unblockIp(${u.id},'${bip.ip}')" class="text-green-400 hover:text-green-300 text-xs">✅ 解除</button>
+        </td>
+      </tr>`);
+    }
 
     return `<tr class="table-row border-b border-dark-700 last:border-0">
       <td class="px-4 py-3">
@@ -532,7 +567,8 @@ function renderTable() {
           <button onclick="deleteUser(${u.id})" class="text-slate-500 hover:text-red-400 text-xs transition-colors" title="删除">🗑️</button>
         </div>
       </td>
-    </tr>`;
+    </tr>
+    ${allIpRows.join('')}`;
   }).join('');
 }
 
@@ -623,6 +659,29 @@ async function doEditUser() {
   } catch (e) { toast(e.message, 'error'); }
 }
 
+
+/* ── IP fold / unfold ── */
+function toggleIps(userId) {
+  document.querySelectorAll(`.ip-subrow[data-user="${userId}"]`).forEach(row => {
+    row.classList.toggle('hidden');
+  });
+}
+
+async function blockIp(userId, ip) {
+  try {
+    await api('POST', `/api/users/${userId}/block-ip`, { ip });
+    toast(`已拉黑 IP ${ip}`, 'success');
+    await loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function unblockIp(userId, ip) {
+  try {
+    await api('POST', `/api/users/${userId}/unblock-ip`, { ip });
+    toast(`已解除 IP ${ip}`, 'success');
+    await loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
 
 async function syncFromXray() {
   try {
