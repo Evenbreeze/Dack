@@ -206,7 +206,11 @@ function getOnlineEmails() {
     if (!tMatch || !eMatch) continue;
 
     const [, yr, mo, dy, hr, mi, sc] = tMatch;
-    const ts    = new Date(`${yr}/${mo}/${dy} ${hr}:${mi}:${sc}`).getTime();
+    // 按服务器本地时区解析（与 Xray access.log 一致），避免字符串解析导致时差
+    const ts    = new Date(
+      Number(yr), Number(mo) - 1, Number(dy),
+      Number(hr), Number(mi), Number(sc)
+    ).getTime();
     const email = eMatch[1];
 
     const ipMatch = line.match(/from\s+([\d.]+):/);
