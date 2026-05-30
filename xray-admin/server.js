@@ -258,31 +258,41 @@ async function main() {
 
       let user = users.update(req.params.id, patch);
 
-      // If approved and remark changed → sync email in Xray
+      // Collect all Xray config changes, write once, respond BEFORE reloading
+      let xcfgDirty = null;
+      let needReload = false;
+
+      // Email-only update: write to disk but NO immediate reload
+      // (reload would drop the admin's VPN connection if they access panel via Xray)
       if (remark !== undefined && user.status === 'approved') {
         try {
-          const xcfg = xray.readConfig();
-          xray.updateClientEmail(xcfg, user.uuid, user.remark);
-          xray.writeConfig(xcfg);
-          xray.reloadXray();
+          xcfgDirty = xray.readConfig();
+          xray.updateClientEmail(xcfgDirty, user.uuid, user.remark);
         } catch {}
       }
 
-      // If was expired and now has a new future expiry → re-approve
+      // Re-approving expired user: needs reload so they can reconnect
       if (duration !== undefined && duration !== -1 && user.status === 'expired') {
         const newExpiry = patch.expires_at;
         if (!newExpiry || new Date(newExpiry) > new Date()) {
           try {
-            const xcfg = xray.readConfig();
-            xray.addClient(xcfg, user.uuid, user.remark || user.uuid.slice(0, 8));
-            xray.writeConfig(xcfg);
-            xray.reloadXray();
+            if (!xcfgDirty) xcfgDirty = xray.readConfig();
+            xray.addClient(xcfgDirty, user.uuid, user.remark || user.uuid.slice(0, 8));
+            needReload = true;
             user = users.update(user.id, { status: 'approved' });
           } catch {}
         }
       }
 
+      if (xcfgDirty) {
+        try { xray.writeConfig(xcfgDirty); } catch {}
+      }
+
+      // Send HTTP response FIRST, then reload Xray asynchronously
       res.json(user);
+      if (needReload) {
+        setImmediate(() => { try { xray.reloadXray(); } catch {} });
+      }
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
