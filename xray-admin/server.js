@@ -1,709 +1,821 @@
-'use strict';
-
-const express    = require('express');
-const https      = require('https');
-const http       = require('http');
-const fs         = require('fs');
-const path       = require('path');
-const crypto     = require('crypto');
-const readline   = require('readline');
-const { spawnSync } = require('child_process');
-
-const { users, ipBlocks } = require('./db');
-const xray = require('./xray');
-
-const CFG_FILE = path.join(__dirname, 'admin.config.json');
-
-/* ─── Expiry helpers ────────────────────────────────── */
-
-// duration: days (0 = permanent, positive = N days from now)
-function calcExpiresAt(durationDays) {
-  if (!durationDays || durationDays <= 0) return null;
-  const d = new Date();
-  d.setDate(d.getDate() + durationDays);
-  return d.toISOString();
-}
-
-/* ─── Admin config ──────────────────────────────────── */
-
-function loadCfg() {
-  if (fs.existsSync(CFG_FILE)) {
-    try { return JSON.parse(fs.readFileSync(CFG_FILE, 'utf8')); } catch {}
-  }
-  return null;
-}
-
-function saveCfg(cfg) {
-  fs.writeFileSync(CFG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
-}
-
-function hashPwd(pwd) {
-  return crypto.createHash('sha256').update(pwd).digest('hex');
-}
-
-/* ─── First-run wizard ──────────────────────────────── */
-
-async function setupWizard() {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = q => new Promise(resolve => rl.question(q, resolve));
-
-  console.log('\n╔══════════════════════════════════════╗');
-  console.log('║     Xray 管理后台 — 首次配置         ║');
-  console.log('╚══════════════════════════════════════╝\n');
-
-  const username = (await ask('管理员用户名 [admin]: ')).trim() || 'admin';
-
-  let password = '';
-  while (password.length < 6) {
-    password = (await ask('管理员密码（至少 6 位）: ')).trim();
-    if (password.length < 6) console.log('  ✗ 密码太短，请重新输入');
-  }
-
-  const portStr = (await ask('后台监听端口 [39271]: ')).trim();
-  const port = parseInt(portStr) || 39271;
-
-  const pathIn = (await ask('访问路径（留空则随机生成）: ')).trim();
-  let adminPath = pathIn ? (pathIn.startsWith('/') ? pathIn : '/' + pathIn)
-                         : '/' + crypto.randomBytes(8).toString('hex');
-
-  const serverIp = (await ask('服务器公网 IP: ')).trim();
-
-  rl.close();
-
-  const cfg = { username, passwordHash: hashPwd(password), port, adminPath, serverIp };
-  saveCfg(cfg);
-
-  console.log('\n✅ 配置完成！');
-  console.log(`🔗 访问地址: https://${serverIp}:${port}${adminPath}`);
-  console.log('⚠️  浏览器会提示证书风险，点击"继续"即可\n');
-
-  return cfg;
-}
-
-/* ─── Self-signed cert ──────────────────────────────── */
-
-function ensureCert() {
-  const cert = path.join(__dirname, 'cert.pem');
-  const key  = path.join(__dirname, 'key.pem');
-
-  if (!fs.existsSync(cert) || !fs.existsSync(key)) {
-    console.log('生成自签名证书...');
-    const r = spawnSync('openssl', [
-      'req', '-x509', '-newkey', 'rsa:2048',
-      '-keyout', key, '-out', cert,
-      '-days', '3650', '-nodes',
-      '-subj', '/CN=xray-admin',
-    ], { timeout: 30000, stdio: 'pipe' });
-
-    if (r.status !== 0) {
-      console.warn('openssl 不可用，将以 HTTP 模式运行');
-      return null;
-    }
-    console.log('✅ 证书生成成功');
-  }
-  return { cert: fs.readFileSync(cert), key: fs.readFileSync(key) };
-}
-
-/* ─── App ───────────────────────────────────────────── */
-
-async function main() {
-  let cfg = loadCfg();
-  if (!cfg) cfg = await setupWizard();
-
-  const app  = express();
-  const BASE = cfg.adminPath;
-
-  app.use(express.json());
-  // Serve static files; index.html auto-detects BASE from URL — no replacement needed
-  app.use(BASE, express.static(path.join(__dirname, 'public')));
-
-  function serveIndex(res) {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-  }
-
-  /* ── Session store (24-hour expiry) ── */
-  const sessions    = new Map();
-  const mkToken     = () => crypto.randomBytes(32).toString('hex');
-  const SESSION_TTL = 24 * 60 * 60 * 1000; // 24 hours
-
-  function auth(req, res, next) {
-    const token = req.headers['x-auth-token'];
-    const sess  = sessions.get(token);
-    if (sess) {
-      if (Date.now() - sess.at < SESSION_TTL) return next();
-      sessions.delete(token); // expired — clean up
-    }
-    res.status(401).json({ error: '未登录' });
-  }
-
-  /* ── Login rate limiter (max 10 attempts per IP per 5 min) ── */
-  const loginAttempts = new Map(); // ip → { count, resetAt }
-
-  function checkLoginRate(ip) {
-    const now  = Date.now();
-    let   rec  = loginAttempts.get(ip);
-    if (!rec || now > rec.resetAt) {
-      rec = { count: 0, resetAt: now + 5 * 60 * 1000 };
-    }
-    rec.count++;
-    loginAttempts.set(ip, rec);
-    return rec.count;
-  }
-
-  // Clean up stale rate-limit records every 10 minutes
-  setInterval(() => {
-    const now = Date.now();
-    for (const [ip, rec] of loginAttempts) {
-      if (now > rec.resetAt) loginAttempts.delete(ip);
-    }
-  }, 10 * 60 * 1000);
-
-  /* ── Login / Logout ── */
-
-  app.post(`${BASE}/api/login`, (req, res) => {
-    const ip = req.socket.remoteAddress || 'unknown';
-    const attempts = checkLoginRate(ip);
-    if (attempts > 10) {
-      return res.status(429).json({ error: '尝试次数过多，请5分钟后再试' });
-    }
-
-    const { username, password } = req.body || {};
-    if (username === cfg.username && hashPwd(password || '') === cfg.passwordHash) {
-      loginAttempts.delete(ip); // reset on success
-      const token = mkToken();
-      sessions.set(token, { at: Date.now() });
-      return res.json({ token });
-    }
-    res.status(401).json({ error: '用户名或密码错误' });
-  });
-
-  app.post(`${BASE}/api/logout`, auth, (req, res) => {
-    sessions.delete(req.headers['x-auth-token']);
-    res.json({ ok: true });
-  });
-
-  /* ── Users ── */
-
-  app.get(`${BASE}/api/users`, auth, (req, res) => {
-    try {
-      const list = users.all();
-      const { online, lastSeen, onlineIps } = xray.getOnlineEmails();
-
-      // Get the full set of blocked IPs from Xray routing + DB
-      let xrayBlockedIps = [];
-      try {
-        const xcfg = xray.readConfig();
-        xrayBlockedIps = xray.getBlockedSourceIps(xcfg);
-      } catch {}
-
-      const result = list.map(u => {
-        const email       = u.remark || u.uuid.slice(0, 8);
-        const isOnline    = online.has(email);
-        const onlineIpSet = new Set(onlineIps[email] || []);
-        const logIps      = allIpTimes[email] || []; // [{ip, lastSeen}] sorted desc
-
-        if (isOnline) {
-          users.touchSeen(u.uuid);
-          const firstIp = logIps.find(x => onlineIpSet.has(x.ip));
-          if (firstIp) users.update(u.id, { last_ip: firstIp.ip });
-        }
-
-        // Merge log IPs + DB-blocked IPs (from db but not in log)
-        const seenInLog = new Set(logIps.map(x => x.ip));
-        const dbOnlyBlocked = ipBlocks.byUserId(u.id)
-          .filter(b => !seenInLog.has(b.ip))
-          .map(b => ({ ip: b.ip, lastSeen: null, isOnline: false, blocked: true }));
-
-        const allIpDetails = [
-          ...logIps.map(({ ip, lastSeen: ts }) => ({
-            ip,
-            lastSeen:  ts ? new Date(ts).toISOString() : null,
-            isOnline:  onlineIpSet.has(ip),
-            blocked:   xrayBlockedIps.includes(ip),
-          })),
-          ...dbOnlyBlocked,
-        ];
-
-        return {
-          ...u,
-          isOnline,
-          allIpDetails,
-          // Keep last_seen for internal use (not shown in main row)
-          last_seen: isOnline ? new Date().toISOString()
-                   : lastSeen[email] ? new Date(lastSeen[email]).toISOString()
-                   : u.last_seen,
-        };
-      });
-
-      res.json(result);
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.post(`${BASE}/api/users`, auth, (req, res) => {
-    try {
-      const { remark, duration, max_ips, traffic_limit } = req.body || {};
-      const uuid  = crypto.randomUUID();
-      const email = remark || uuid.slice(0, 8);
-
-      // Step 1: add to Xray first — if this fails, nothing written to DB
-      const xcfg = xray.readConfig();
-      xray.addClient(xcfg, uuid, email);
-      xray.writeConfig(xcfg);
-      xray.reloadXray();
-
-      // Step 2: create in DB after Xray succeeds
-      let user = users.create(uuid, remark);
-      const expires_at  = calcExpiresAt(parseInt(duration) || 0);
-      const parsedMaxIps = parseInt(max_ips);
-      const parsedTrafficLimit = parseInt(traffic_limit) || 0;
-      user = users.update(user.id, {
-        expires_at,
-        max_ips:       isNaN(parsedMaxIps) ? 1 : parsedMaxIps,
-        traffic_limit: parsedTrafficLimit,
-      });
-
-      res.json(user);
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.put(`${BASE}/api/users/:id`, auth, (req, res) => {
-    try {
-      const { remark, note, duration, max_ips, traffic_limit } = req.body || {};
-      const patch = {};
-      if (remark        !== undefined) patch.remark        = remark;
-      if (note          !== undefined) patch.note          = note;
-      if (max_ips       !== undefined) patch.max_ips       = parseInt(max_ips);
-      if (traffic_limit !== undefined) patch.traffic_limit = parseInt(traffic_limit) || 0;
-      if (duration !== undefined && duration !== -1) {
-        patch.expires_at = calcExpiresAt(parseInt(duration) || 0);
-      }
-
-      let user = users.update(req.params.id, patch);
-
-      // Collect all Xray config changes, write once, respond BEFORE reloading
-      let xcfgDirty = null;
-      let needReload = false;
-
-      // Email-only update: write to disk but NO immediate reload
-      // (reload would drop the admin's VPN connection if they access panel via Xray)
-      if (remark !== undefined && user.status === 'approved') {
-        try {
-          xcfgDirty = xray.readConfig();
-          xray.updateClientEmail(xcfgDirty, user.uuid, user.remark);
-        } catch {}
-      }
-
-      // Re-approving expired user: needs reload so they can reconnect
-      if (duration !== undefined && duration !== -1 && user.status === 'expired') {
-        const newExpiry = patch.expires_at;
-        if (!newExpiry || new Date(newExpiry) > new Date()) {
-          try {
-            if (!xcfgDirty) xcfgDirty = xray.readConfig();
-            xray.addClient(xcfgDirty, user.uuid, user.remark || user.uuid.slice(0, 8));
-            needReload = true;
-            user = users.update(user.id, { status: 'approved' });
-          } catch {}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Xray 管理后台</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          dark: { 900:'#0f172a', 800:'#1e293b', 700:'#334155', 600:'#475569' }
         }
       }
-
-      if (xcfgDirty) {
-        try { xray.writeConfig(xcfgDirty); } catch {}
-      }
-
-      // Send HTTP response FIRST, then reload Xray asynchronously
-      res.json(user);
-      if (needReload) {
-        setImmediate(() => { try { xray.reloadXray(); } catch {} });
-      }
-    } catch (e) {
-      res.status(500).json({ error: e.message });
     }
-  });
+  }
+</script>
+<style>
+  body { background:#0f172a; color:#f1f5f9; font-family:'Segoe UI',system-ui,sans-serif; }
+  .badge { @apply text-xs font-semibold px-2 py-0.5 rounded-full; }
+  input, select, textarea {
+    background:#1e293b; border:1px solid #334155; color:#f1f5f9;
+    border-radius:6px; padding:8px 12px; width:100%; outline:none;
+    transition:border-color .2s;
+  }
+  input:focus, select:focus, textarea:focus { border-color:#3b82f6; }
+  .btn { @apply px-4 py-2 rounded-lg font-medium transition-all duration-150 cursor-pointer; }
+  .btn-primary { @apply bg-blue-600 hover:bg-blue-500 text-white; }
+  .btn-danger  { @apply bg-red-600 hover:bg-red-500 text-white; }
+  .btn-success { @apply bg-green-600 hover:bg-green-500 text-white; }
+  .btn-ghost   { @apply bg-slate-700 hover:bg-slate-600 text-slate-200; }
+  .card { background:#1e293b; border:1px solid #334155; border-radius:12px; }
+  .modal-bg { position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:50;display:flex;align-items:center;justify-content:center; }
+  .modal { background:#1e293b;border:1px solid #334155;border-radius:14px;width:100%;max-width:480px;padding:28px; }
+  .table-row:hover { background:#1e293b44; }
+  ::-webkit-scrollbar { width:6px; }
+  ::-webkit-scrollbar-track { background:#0f172a; }
+  ::-webkit-scrollbar-thumb { background:#334155; border-radius:3px; }
+  .spin { animation:spin 1s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
 
-  /* Sync users from Xray config into DB */
-  app.post(`${BASE}/api/sync-xray`, auth, (req, res) => {
-    try {
-      const xcfg    = xray.readConfig();
-      const clients = xray.getClients(xcfg);
+<!-- ══════════════ LOGIN PAGE ══════════════ -->
+<div id="loginPage" class="min-h-screen flex items-center justify-center p-4">
+  <div class="card p-8 w-full max-w-sm">
+    <div class="text-center mb-8">
+      <div class="text-4xl mb-3">🛡️</div>
+      <h1 class="text-xl font-bold text-white">Xray 管理后台</h1>
+      <p class="text-slate-400 text-sm mt-1">请输入管理员凭据</p>
+    </div>
+    <div class="space-y-4">
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">用户名</label>
+        <input id="loginUser" type="text" placeholder="" autocomplete="username" />
+      </div>
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">密码</label>
+        <input id="loginPass" type="password" placeholder="" autocomplete="current-password"
+               onkeydown="if(event.key==='Enter') doLogin()" />
+      </div>
+      <button class="btn btn-primary w-full mt-2" onclick="doLogin()">登 录</button>
+      <p id="loginErr" class="text-red-400 text-sm text-center hidden"></p>
+    </div>
+  </div>
+</div>
 
-      // Build uuid → alias from all config_export.json files (vless.sh output)
-      const aliasMap = {};
-      const exportCandidates = [
-        '/etc/xray/config_export.json',
-        '/usr/local/etc/xray/config_export.json',
-        '/opt/xray/config_export.json',
-      ];
-      for (const p of exportCandidates) {
-        try {
-          if (!fs.existsSync(p)) continue;
-          const exported = JSON.parse(fs.readFileSync(p, 'utf8'));
-          const link = exported?.xray_config?.vless_link;
-          if (link) {
-            const uuidM  = link.match(/vless:\/\/([^@]+)@/);
-            const aliasM = link.match(/#(.+)$/);
-            if (uuidM && aliasM) {
-              aliasMap[uuidM[1]] = decodeURIComponent(aliasM[1]);
-            }
-          }
-        } catch {}
-        // Don't break — scan all candidates to collect all aliases
-      }
+<!-- ══════════════ MAIN APP ══════════════ -->
+<div id="app" class="hidden min-h-screen flex flex-col">
 
-      const imported    = [];
-      const updated     = [];
-      const skipped     = [];
-      let   xrayChanged = false;
+  <!-- Topbar -->
+  <header class="bg-dark-800 border-b border-dark-700 px-6 py-3 flex items-center justify-between sticky top-0 z-40">
+    <div class="flex items-center gap-3">
+      <span class="text-xl">🛡️</span>
+      <span class="font-bold text-white">Xray 管理后台</span>
+    </div>
+    <div class="flex items-center gap-4">
+      <div class="flex gap-1 bg-dark-700 rounded-lg p-1">
+        <button class="nav-btn px-3 py-1 rounded text-sm font-medium transition-colors" data-tab="users" onclick="switchTab('users')">用户管理</button>
+        <button class="nav-btn px-3 py-1 rounded text-sm font-medium transition-colors" data-tab="settings" onclick="switchTab('settings')">设置</button>
+      </div>
+      <button onclick="doLogout()" class="text-slate-400 hover:text-red-400 text-sm transition-colors">退出</button>
+    </div>
+  </header>
 
-      for (const c of clients) {
-        if (!c.id) continue;
+  <!-- Stats bar -->
+  <div id="statsBar" class="bg-dark-800 border-b border-dark-700 px-6 py-3 flex gap-6">
+    <div class="flex items-center gap-2">
+      <div class="w-2 h-2 bg-slate-500 rounded-full"></div>
+      <span class="text-slate-400 text-sm">总用户 <span id="statTotal" class="text-white font-semibold">-</span></span>
+    </div>
+    <div class="flex items-center gap-2">
+      <div class="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
+      <span class="text-slate-400 text-sm">在线 <span id="statOnline" class="text-green-400 font-semibold">-</span></span>
+    </div>
+    <div class="flex items-center gap-2">
+      <div class="w-2 h-2 bg-blue-400 rounded-full"></div>
+      <span class="text-slate-400 text-sm">正常 <span id="statApproved" class="text-blue-400 font-semibold">-</span></span>
+    </div>
+    <div class="flex items-center gap-2">
+      <div class="w-2 h-2 bg-red-400 rounded-full"></div>
+      <span class="text-slate-400 text-sm">已拉黑 <span id="statBlocked" class="text-red-400 font-semibold">-</span></span>
+    </div>
+    <div class="flex items-center gap-2">
+      <div class="w-2 h-2 bg-slate-500 rounded-full"></div>
+      <span class="text-slate-400 text-sm">已到期 <span id="statExpired" class="text-slate-400 font-semibold">-</span></span>
+    </div>
+    <div class="ml-auto flex items-center gap-2">
+      <span id="refreshStatus" class="text-slate-500 text-xs"></span>
+      <button onclick="loadUsers()" class="text-slate-400 hover:text-blue-400 text-sm transition-colors" title="刷新">↻</button>
+    </div>
+  </div>
 
-        const alias    = aliasMap[c.id] || c.email || c.id.slice(0, 8);
-        const existing = users.all().find(u => u.uuid === c.id);
+  <!-- Content -->
+  <main class="flex-1 p-6">
 
-        if (existing) {
-          // If we found a better alias, update remark + Xray email
-          if (aliasMap[c.id] && existing.remark !== aliasMap[c.id]) {
-            users.update(existing.id, { remark: aliasMap[c.id] });
-            xray.updateClientEmail(xcfg, c.id, aliasMap[c.id]);
-            xrayChanged = true;
-            updated.push({ uuid: c.id, remark: aliasMap[c.id] });
-          } else {
-            skipped.push(c.id);
-          }
-          continue;
-        }
+    <!-- ── Users Tab ── -->
+    <div id="tabUsers">
+      <!-- Toolbar -->
+      <div class="flex items-center gap-3 mb-4">
+        <input id="searchBox" type="text" placeholder="搜索备注 / UUID…"
+               class="max-w-xs" oninput="renderTable()" />
+        <select id="filterStatus" onchange="renderTable()" class="w-36">
+          <option value="">全部状态</option>
+          <option value="approved">正常</option>
+          <option value="blocked">已拉黑</option>
+          <option value="expired">已到期</option>
+        </select>
+        <button class="btn btn-ghost flex items-center gap-2" onclick="syncFromXray()" title="把 Xray 配置里的现有用户全部导入">
+          ↓ 从 Xray 同步
+        </button>
+        <button class="btn btn-primary flex items-center gap-2" onclick="openAddModal()">
+          <span>＋</span> 添加用户
+        </button>
+      </div>
 
-        // New user: import with alias, and sync Xray email
-        let user = users.create(c.id, alias);
-        users.update(user.id, { status: 'approved' });
-        xray.updateClientEmail(xcfg, c.id, alias);
-        xrayChanged = true;
-        imported.push({ uuid: c.id, remark: alias });
-      }
+      <!-- Table -->
+      <div class="card overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="border-b border-dark-700">
+            <tr class="text-slate-400 text-left">
+              <th class="px-4 py-3 font-medium">备注</th>
+              <th class="px-4 py-3 font-medium">UUID</th>
+              <th class="px-4 py-3 font-medium">状态</th>
+              <th class="px-4 py-3 font-medium">设备</th>
+              <th class="px-4 py-3 font-medium">到期时间</th>
+              <th class="px-4 py-3 font-medium">流量</th>
+              <th class="px-4 py-3 font-medium text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody id="userTable">
+            <tr><td colspan="8" class="text-center py-12 text-slate-500">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
 
-      if (xrayChanged) {
-        xray.writeConfig(xcfg);
-        xray.reloadXray();
-      }
+    <!-- ── Settings Tab ── -->
+    <div id="tabSettings" class="hidden max-w-lg">
+      <div class="card p-6 space-y-6">
+        <h2 class="font-semibold text-white text-lg">系统设置</h2>
 
-      res.json({
-        ok:       true,
-        imported: imported.length,
-        updated:  updated.length,
-        skipped:  skipped.length,
-        details:  [...imported, ...updated],
-      });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
+        <div>
+          <label class="text-sm text-slate-400 block mb-1">服务器公网 IP</label>
+          <input id="setIp" type="text" placeholder="1.2.3.4" />
+          <p class="text-xs text-slate-500 mt-1">用于生成 VLESS 链接</p>
+        </div>
 
-  /* Reset a user's traffic counter */
-  app.post(`${BASE}/api/users/:id/reset-traffic`, auth, (req, res) => {
-    try {
-      const user = users.byId(req.params.id);
-      if (!user) return res.status(404).json({ error: '用户不存在' });
-      res.json(users.update(user.id, { traffic_used: 0 }));
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
+        <div>
+          <label class="text-sm text-slate-400 block mb-1">新密码（留空不修改）</label>
+          <input id="setNewPwd" type="password" placeholder="至少 6 位" />
+        </div>
 
-  /* Block a specific IP (not the whole UUID) */
-  app.post(`${BASE}/api/users/:id/block-ip`, auth, (req, res) => {
-    try {
-      const { ip } = req.body || {};
-      if (!ip) return res.status(400).json({ error: '缺少 IP 参数' });
-      const user = users.byId(req.params.id);
-      if (!user) return res.status(404).json({ error: '用户不存在' });
+        <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
+        <p id="settingsMsg" class="text-sm text-green-400 hidden">✅ 已保存</p>
+      </div>
+    </div>
 
-      const xcfg = xray.readConfig();
-      xray.blockSourceIp(xcfg, ip);
-      xray.writeConfig(xcfg);
-      ipBlocks.block(ip, user.id);
+  </main>
+</div>
 
-      res.json({ ok: true });
-      setImmediate(() => { try { xray.reloadXray(); } catch {} });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
+<!-- ══════════════ MODALS ══════════════ -->
 
-  /* Unblock a specific IP */
-  app.post(`${BASE}/api/users/:id/unblock-ip`, auth, (req, res) => {
-    try {
-      const { ip } = req.body || {};
-      if (!ip) return res.status(400).json({ error: '缺少 IP 参数' });
+<!-- Add User Modal -->
+<div id="addModal" class="modal-bg hidden">
+  <div class="modal">
+    <h3 class="text-lg font-semibold text-white mb-5">添加用户</h3>
+    <div class="space-y-4">
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">备注 / 昵称</label>
+        <input id="addRemark" type="text" placeholder="如：朋友A、自用" />
+      </div>
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">使用期限</label>
+        <select id="addDuration">
+          <option value="0">永久</option>
+          <option value="1">1 天</option>
+          <option value="3">3 天</option>
+          <option value="15">半个月（15天）</option>
+          <option value="30" selected>1 个月（30天）</option>
+          <option value="90">3 个月（90天）</option>
+          <option value="180">半年（180天）</option>
+          <option value="365">1 年（365天）</option>
+          <option value="custom">自定义天数</option>
+        </select>
+        <input id="addCustomDays" type="number" min="1" placeholder="输入天数" class="mt-2 hidden" />
+      </div>
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">最大同时在线设备数</label>
+        <select id="addMaxIps">
+          <option value="1" selected>1 个设备</option>
+          <option value="2">2 个设备</option>
+          <option value="3">3 个设备</option>
+          <option value="5">5 个设备</option>
+          <option value="10">10 个设备</option>
+          <option value="0">不限制</option>
+        </select>
+        <p class="text-xs text-slate-500 mt-1">超出后自动封禁该用户</p>
+      </div>
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">流量限额（GB，0 = 不限）</label>
+        <input id="addTraffic" type="number" min="0" placeholder="0" value="0" />
+        <p class="text-xs text-slate-500 mt-1">在有效期内使用超过此流量自动封禁</p>
+      </div>
+    </div>
+    <div class="flex gap-3 mt-6">
+      <button class="btn btn-primary flex-1" onclick="doAddUser()">创建并激活</button>
+      <button class="btn btn-ghost flex-1" onclick="closeModal('addModal')">取消</button>
+    </div>
+  </div>
+</div>
 
-      const xcfg = xray.readConfig();
-      xray.unblockSourceIp(xcfg, ip);
-      xray.writeConfig(xcfg);
-      ipBlocks.unblock(ip);
+<!-- Edit User Modal -->
+<div id="editModal" class="modal-bg hidden">
+  <div class="modal">
+    <h3 class="text-lg font-semibold text-white mb-5">编辑用户</h3>
+    <input type="hidden" id="editId" />
+    <div class="space-y-4">
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">备注 / 昵称</label>
+        <input id="editRemark" type="text" placeholder="如：朋友A" />
+      </div>
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">续期 / 修改期限</label>
+        <select id="editDuration">
+          <option value="-1">不修改</option>
+          <option value="0">改为永久</option>
+          <option value="1">续期 1 天</option>
+          <option value="3">续期 3 天</option>
+          <option value="15">续期半个月（15天）</option>
+          <option value="30">续期 1 个月（30天）</option>
+          <option value="90">续期 3 个月（90天）</option>
+          <option value="180">续期半年（180天）</option>
+          <option value="365">续期 1 年（365天）</option>
+          <option value="custom">自定义天数</option>
+        </select>
+        <input id="editCustomDays" type="number" min="1" placeholder="输入天数" class="mt-2 hidden" />
+        <p id="editCurrentExpiry" class="text-xs text-slate-500 mt-1"></p>
+      </div>
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">最大同时在线设备数</label>
+        <select id="editMaxIps">
+          <option value="1">1 个设备</option>
+          <option value="2">2 个设备</option>
+          <option value="3">3 个设备</option>
+          <option value="5">5 个设备</option>
+          <option value="10">10 个设备</option>
+          <option value="0">不限制</option>
+        </select>
+      </div>
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">流量限额（GB，0 = 不限）</label>
+        <input id="editTraffic" type="number" min="0" placeholder="0" />
+        <p id="editCurrentTraffic" class="text-xs text-slate-500 mt-1"></p>
+      </div>
+      <div>
+        <label class="text-sm text-slate-400 block mb-1">备注说明（内部笔记）</label>
+        <textarea id="editNote" rows="3" placeholder="自由填写，不对外显示"></textarea>
+      </div>
+    </div>
+    <div class="flex gap-3 mt-6">
+      <button class="btn btn-primary flex-1" onclick="doEditUser()">保 存</button>
+      <button class="btn btn-ghost flex-1" onclick="closeModal('editModal')">取消</button>
+    </div>
+  </div>
+</div>
 
-      res.json({ ok: true });
-      setImmediate(() => { try { xray.reloadXray(); } catch {} });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
+<!-- VLESS Link Modal -->
+<div id="linkModal" class="modal-bg hidden">
+  <div class="modal">
+    <h3 class="text-lg font-semibold text-white mb-4">VLESS 链接</h3>
+    <p class="text-xs text-slate-400 mb-2">复制下方链接发给用户</p>
+    <textarea id="linkText" rows="5"
+      class="font-mono text-xs break-all bg-dark-700 border-dark-600 resize-none"></textarea>
+    <div class="flex gap-3 mt-5">
+      <button class="btn btn-success flex-1" onclick="copyLink()">📋 复制链接</button>
+      <button class="btn btn-ghost flex-1" onclick="closeModal('linkModal')">关闭</button>
+    </div>
+    <p id="copyOk" class="text-green-400 text-sm text-center mt-2 hidden">✅ 已复制</p>
+  </div>
+</div>
 
-  /* Block */
-  app.post(`${BASE}/api/users/:id/block`, auth, (req, res) => {
-    try {
-      const user = users.byId(req.params.id);
-      if (!user) return res.status(404).json({ error: '用户不存在' });
+<!-- Confirm Modal -->
+<div id="confirmModal" class="modal-bg hidden">
+  <div class="modal">
+    <h3 class="text-lg font-semibold text-white mb-2" id="confirmTitle">确认操作</h3>
+    <p class="text-slate-400 text-sm mb-6" id="confirmMsg"></p>
+    <div class="flex gap-3">
+      <button class="btn btn-danger flex-1" id="confirmOkBtn">确认</button>
+      <button class="btn btn-ghost flex-1" onclick="closeModal('confirmModal')">取消</button>
+    </div>
+  </div>
+</div>
 
-      const xcfg = xray.readConfig();
-      xray.removeClient(xcfg, user.uuid);
-      xray.writeConfig(xcfg);
-      xray.reloadXray();
+<!-- Toast -->
+<div id="toast" class="fixed bottom-6 right-6 z-50 hidden">
+  <div id="toastInner" class="px-5 py-3 rounded-xl text-sm font-medium shadow-xl"></div>
+</div>
 
-      res.json(users.update(user.id, { status: 'blocked' }));
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
+<script>
+/* ─────────────────────────── State ─────────────────────────── */
+// Auto-detect BASE from current URL — no server-side injection needed.
+// e.g. https://IP:PORT/a3b69784afd0e8b5/ → BASE = '/a3b69784afd0e8b5'
+const BASE  = window.location.pathname.split('/').slice(0, 2).join('/');
+let TOKEN   = localStorage.getItem('xa_token') || '';
+let allUsers = [];
+let _refreshTimer = null;
 
-  /* Unblock */
-  app.post(`${BASE}/api/users/:id/unblock`, auth, (req, res) => {
-    try {
-      const user = users.byId(req.params.id);
-      if (!user) return res.status(404).json({ error: '用户不存在' });
+/* ─────────────────────────── API ───────────────────────────── */
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type':'application/json', 'X-Auth-Token': TOKEN } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(BASE + path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
 
-      const xcfg  = xray.readConfig();
-      const email = user.remark || user.uuid.slice(0, 8);
-      xray.addClient(xcfg, user.uuid, email);
-      xray.writeConfig(xcfg);
-      xray.reloadXray();
-
-      // If unblocking a user whose traffic quota was already exceeded,
-      // auto-reset their traffic counter so checkTraffic won't re-block
-      // them immediately in the next 5-minute cycle.
-      const patch = { status: 'approved' };
-      if (user.traffic_limit > 0) {
-        const limitBytes = user.traffic_limit * 1073741824;
-        if ((user.traffic_used || 0) >= limitBytes) {
-          patch.traffic_used = 0;
-        }
-      }
-
-      res.json(users.update(user.id, patch));
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  /* Delete */
-  app.delete(`${BASE}/api/users/:id`, auth, (req, res) => {
-    try {
-      const user = users.byId(req.params.id);
-      if (!user) return res.status(404).json({ error: '用户不存在' });
-
-      if (user.status === 'approved') {
-        try {
-          const xcfg = xray.readConfig();
-          xray.removeClient(xcfg, user.uuid);
-          xray.writeConfig(xcfg);
-          xray.reloadXray();
-        } catch {}
-      }
-
-      users.remove(user.id);
-      res.json({ ok: true });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  /* Get VLESS link */
-  app.get(`${BASE}/api/users/:id/link`, auth, (req, res) => {
-    try {
-      const user = users.byId(req.params.id);
-      if (!user) return res.status(404).json({ error: '用户不存在' });
-      const xcfg = xray.readConfig();
-      const link = xray.buildVlessLink(user.uuid, user.remark, xcfg, cfg.serverIp);
-      res.json({ link });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  /* ── Settings ── */
-
-  app.get(`${BASE}/api/settings`, auth, (req, res) => {
-    res.json({ serverIp: cfg.serverIp, username: cfg.username });
-  });
-
-  app.put(`${BASE}/api/settings`, auth, (req, res) => {
-    try {
-      const { serverIp, newPassword } = req.body || {};
-      if (serverIp) cfg.serverIp = serverIp;
-      if (newPassword && newPassword.length >= 6) {
-        cfg.passwordHash = hashPwd(newPassword);
-      }
-      saveCfg(cfg);
-      res.json({ ok: true });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  /* ── Catch-all SPA ── */
-  app.get(`${BASE}`,    (req, res) => serveIndex(res));
-  app.get(`${BASE}/`,   (req, res) => serveIndex(res));
-  app.get(`${BASE}/*`,  (req, res) => {
-    if (/\.\w+$/.test(req.path)) return res.status(404).send('Not Found');
-    serveIndex(res);
-  });
-  app.use((req, res) => res.status(404).send('Not Found'));
-
-  /* ── Enable Xray Stats API on startup ── */
+/* ─────────────────────────── Auth ──────────────────────────── */
+async function doLogin() {
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value;
+  document.getElementById('loginErr').classList.add('hidden');
   try {
-    const xcfg = xray.readConfig();
-    if (xray.enableStats(xcfg)) {
-      xray.writeConfig(xcfg);
-      xray.reloadXray();
-      console.log('✅ Xray 流量统计已启用');
-    }
+    const d = await api('POST', '/api/login', { username: u, password: p });
+    TOKEN = d.token;
+    localStorage.setItem('xa_token', TOKEN);
+    showApp();
   } catch (e) {
-    console.warn('⚠️  无法启用 Xray 流量统计（节点未安装？）:', e.message);
+    const el = document.getElementById('loginErr');
+    el.textContent = e.message;
+    el.classList.remove('hidden');
+  }
+}
+
+async function doLogout() {
+  if (_refreshTimer) { clearInterval(_refreshTimer); _refreshTimer = null; }
+  try { await api('POST', '/api/logout'); } catch {}
+  TOKEN = '';
+  localStorage.removeItem('xa_token');
+  document.getElementById('app').classList.add('hidden');
+  document.getElementById('loginPage').classList.remove('hidden');
+}
+
+function showApp() {
+  document.getElementById('loginPage').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  switchTab('users');
+  loadUsers();
+  loadSettings();
+}
+
+/* ─────────────────────────── Tabs ──────────────────────────── */
+function switchTab(tab) {
+  ['users','settings'].forEach(t => {
+    document.getElementById('tab' + t.charAt(0).toUpperCase() + t.slice(1)).classList.toggle('hidden', t !== tab);
+    const btn = document.querySelector(`[data-tab="${t}"]`);
+    if (btn) btn.classList.toggle('bg-dark-800', t === tab);
+    if (btn) btn.classList.toggle('text-white', t === tab);
+    if (btn) btn.classList.toggle('text-slate-400', t !== tab);
+  });
+}
+
+/* ─────────────────────────── Users ─────────────────────────── */
+async function loadUsers() {
+  document.getElementById('refreshStatus').textContent = '刷新中…';
+  try {
+    allUsers = await api('GET', '/api/users');
+    renderTable();
+    updateStats();
+    document.getElementById('refreshStatus').textContent =
+      '更新于 ' + new Date().toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  } catch (e) {
+    if (e.message === '未登录') { doLogout(); return; }
+    toast('刷新失败: ' + e.message, 'error');
+  }
+}
+
+function updateStats() {
+  const total    = allUsers.length;
+  const online   = allUsers.filter(u => u.isOnline).length;
+  const approved = allUsers.filter(u => u.status === 'approved').length;
+  const blocked  = allUsers.filter(u => u.status === 'blocked').length;
+  const expired  = allUsers.filter(u => u.status === 'expired').length;
+  document.getElementById('statTotal').textContent    = total;
+  document.getElementById('statOnline').textContent   = online;
+  document.getElementById('statApproved').textContent = approved;
+  document.getElementById('statBlocked').textContent  = blocked;
+  const expEl = document.getElementById('statExpired');
+  if (expEl) expEl.textContent = expired;
+}
+
+function renderTable() {
+  const q      = document.getElementById('searchBox').value.trim().toLowerCase();
+  const status = document.getElementById('filterStatus').value;
+
+  let list = allUsers.filter(u => {
+    const matchQ = !q || u.remark?.toLowerCase().includes(q) || u.uuid.includes(q);
+    const matchS = !status || u.status === status;
+    return matchQ && matchS;
+  });
+
+  const tbody = document.getElementById('userTable');
+
+  if (!list.length) {
+    tbody.innerHTML = `<tr><td colspan="7" class="text-center py-12 text-slate-500">暂无数据</td></tr>`;
+    return;
   }
 
-  /* ── Expiry checker: every 60 s ── */
-  function checkExpired() {
-    try {
-      const expired = users.getExpired();
-      if (!expired.length) return;
+  tbody.innerHTML = list.map(u => {
+    const statusBadge = {
+      approved: '<span class="badge bg-green-900 text-green-300">正常</span>',
+      blocked:  '<span class="badge bg-red-900 text-red-300">已拉黑</span>',
+      expired:  '<span class="badge bg-slate-700 text-slate-400">已到期</span>',
+    }[u.status] || '<span class="badge bg-slate-700 text-slate-400">未知</span>';
 
-      const xcfg = xray.readConfig();
-      for (const u of expired) xray.removeClient(xcfg, u.uuid);
+    const onlineDot = u.isOnline
+      ? '<span class="inline-block w-2 h-2 bg-green-400 rounded-full mr-1 animate-pulse"></span>'
+      : '';
 
-      xray.writeConfig(xcfg);
-      xray.reloadXray();
+    const lastSeen = u.last_seen
+      ? new Date(u.last_seen).toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})
+      : '—';
 
-      for (const u of expired) {
-        users.update(u.id, { status: 'expired' });
-        console.log(`[到期] 用户 "${u.remark || u.uuid.slice(0, 8)}" 已到期，自动封禁`);
-      }
-    } catch (e) {
-      console.error('[到期检测] 错误:', e.message);
+    const uuidShort = u.uuid.slice(0, 8) + '…';
+
+    // Traffic display
+    const trafficLimit = u.traffic_limit || 0;   // GB
+    const trafficUsed  = u.traffic_used  || 0;   // bytes
+    const usedGB  = (trafficUsed / 1073741824).toFixed(2);
+    let trafficHtml;
+    if (!trafficLimit) {
+      trafficHtml = `<span class="text-slate-500 text-xs">不限</span>`;
+    } else {
+      const pct      = Math.min(100, Math.round(trafficUsed / (trafficLimit * 1073741824) * 100));
+      const barColor = pct >= 90 ? 'bg-red-500' : pct >= 70 ? 'bg-yellow-500' : 'bg-blue-500';
+      trafficHtml = `<div class="text-xs">
+        <span class="${pct >= 90 ? 'text-red-400' : 'text-slate-400'}">${usedGB}/${trafficLimit}GB</span>
+        <div class="w-20 h-1.5 bg-slate-700 rounded mt-1">
+          <div class="${barColor} h-1.5 rounded" style="width:${pct}%"></div>
+        </div>
+      </div>`;
     }
-  }
 
-  checkExpired();
-  setInterval(checkExpired, 60 * 1000);
-
-  /* ── Traffic checker: every 5 min ── */
-  function checkTraffic() {
-    try {
-      // Step 1: only proceed if there are traffic-limited users
-      const limited = users.getTrafficLimited();
-      if (!limited.length) return;
-
-      // Step 2: query Xray stats (resets counters — do this only when needed)
-      const stats = xray.queryTrafficStats();
-      if (!Object.keys(stats).length) return;
-
-      // Step 3: always update traffic in DB first (before any Xray ops)
-      // so data is not lost if Xray config write fails
-      const toBlock = [];
-      for (const u of limited) {
-        const email = u.remark || u.uuid.slice(0, 8);
-        const st    = stats[email];
-        if (!st || !st.total) continue;
-
-        const newUsed    = (u.traffic_used || 0) + st.total;
-        const limitBytes = u.traffic_limit * 1024 * 1024 * 1024;
-
-        users.update(u.id, { traffic_used: newUsed });
-
-        if (newUsed >= limitBytes) {
-          console.log(`[流量超限] "${email}" 已用 ${(newUsed / 1073741824).toFixed(2)} GB，` +
-                      `限额 ${u.traffic_limit} GB，自动封禁`);
-          toBlock.push(u);
-        }
-      }
-
-      // Step 4: block exceeded users — read Xray config only if needed
-      if (toBlock.length) {
-        const xcfg = xray.readConfig();
-        for (const u of toBlock) xray.removeClient(xcfg, u.uuid);
-        xray.writeConfig(xcfg);
-        xray.reloadXray();
-        for (const u of toBlock) users.update(u.id, { status: 'blocked' });
-      }
-    } catch (e) {
-      console.error('[流量检测] 错误:', e.message);
+    // Device column: clickable to expand IP list
+    const allIpDetails = u.allIpDetails || [];
+    const onlineCount  = allIpDetails.filter(x => x.isOnline).length;
+    const totalCount   = allIpDetails.length;
+    const maxIps       = u.max_ips || 0;
+    const exceeded     = maxIps > 0 && onlineCount > maxIps;
+    let deviceHtml;
+    if (totalCount === 0) {
+      deviceHtml = `<span class="text-slate-600 text-xs">无记录</span>`;
+    } else if (!u.isOnline) {
+      deviceHtml = `<button onclick="toggleIps(${u.id})" class="text-slate-500 text-xs hover:text-slate-300">
+        离线 (${totalCount}条记录) ▾
+      </button>`;
+    } else if (exceeded) {
+      deviceHtml = `<button onclick="toggleIps(${u.id})" class="text-red-400 text-xs font-semibold">
+        ⚠️ ${onlineCount}/${maxIps} 个在线 ▾
+      </button>`;
+    } else {
+      const label = maxIps > 0 ? `${onlineCount}/${maxIps}` : `${onlineCount}`;
+      deviceHtml = `<button onclick="toggleIps(${u.id})" class="text-green-400 text-xs">
+        🟢 ${label} 个在线 ▾
+      </button>`;
     }
-  }
 
-  checkTraffic();
-  setInterval(checkTraffic, 5 * 60 * 1000);
-
-  /* ── IP limit checker: every 60 s ── */
-  function checkIpLimits() {
-    try {
-      const approved = users.getApproved();
-      if (!approved.length) return;
-
-      const { onlineIps } = xray.getOnlineEmails();
-
-      // Step 1: find who exceeded — no Xray I/O yet
-      const toBlock = [];
-      for (const u of approved) {
-        const limit = u.max_ips;
-        if (!limit || limit <= 0) continue;
-
-        const email = u.remark || u.uuid.slice(0, 8);
-        const ips   = onlineIps[email] || [];
-        if (ips.length <= limit) continue;
-
-        console.log(`[IP超限] "${email}" 在线 ${ips.length} 个IP，上限 ${limit}，自动封禁`);
-        toBlock.push(u);
-      }
-
-      // Step 2: block exceeded users — read Xray config only if needed
-      if (toBlock.length) {
-        const xcfg = xray.readConfig();
-        for (const u of toBlock) xray.removeClient(xcfg, u.uuid);
-        xray.writeConfig(xcfg);
-        xray.reloadXray();
-        for (const u of toBlock) users.update(u.id, { status: 'blocked' });
-      }
-    } catch (e) {
-      console.error('[IP限制检测] 错误:', e.message);
+    // Expiry display
+    let expiryHtml = '<span class="text-slate-500">永久</span>';
+    if (u.expires_at) {
+      const now   = Date.now();
+      const exp   = new Date(u.expires_at).getTime();
+      const days  = Math.ceil((exp - now) / 86400000);
+      if (days < 0)       expiryHtml = '<span class="text-red-400">已到期</span>';
+      else if (days === 0) expiryHtml = '<span class="text-red-400">今天到期</span>';
+      else if (days <= 3) expiryHtml = `<span class="text-yellow-400">${days} 天后</span>`;
+      else                expiryHtml = `<span class="text-slate-400">${days} 天后</span>`;
     }
-  }
 
-  checkIpLimits();
-  setInterval(checkIpLimits, 60 * 1000);
+    // Action buttons — only pass numeric id to avoid quote-injection from remark
+    let blockBtn = '';
+    if (u.status === 'approved') {
+      blockBtn = `<button onclick="blockUser(${u.id})" class="text-red-400 hover:text-red-300 text-xs transition-colors" title="拉黑">🚫 拉黑</button>`;
+    } else if (u.status === 'blocked') {
+      blockBtn = `<button onclick="unblockUser(${u.id})" class="text-green-400 hover:text-green-300 text-xs transition-colors" title="解除拉黑">✅ 解黑</button>`;
+    }
+    // expired: no block/unblock — admin edits duration to renew
 
-  /* ── Start HTTPS / HTTP ── */
-  const tls = ensureCert();
-  const { port } = cfg;
+    // IP sub-rows (hidden by default, toggled on click) — show ALL historical IPs
+    const allIpRows = allIpDetails.map(ipd => {
+      const statusHtml = ipd.blocked
+        ? `<span class="badge bg-red-900 text-red-300">已拉黑</span>`
+        : ipd.isOnline
+          ? `<span class="text-green-400 text-xs">在线</span>`
+          : `<span class="text-slate-600 text-xs">离线</span>`;
 
-  if (tls) {
-    https.createServer(tls, app).listen(port, () => {
-      console.log(`\n✅ 管理后台已启动 (HTTPS)`);
-      console.log(`🔗 https://${cfg.serverIp}:${port}${BASE}\n`);
+      const timeHtml = ipd.lastSeen
+        ? `<span class="text-slate-500 text-xs">${timeAgo(ipd.lastSeen)}</span>`
+        : `<span class="text-slate-700 text-xs">未知</span>`;
+
+      const actionHtml = ipd.blocked
+        ? `<button onclick="unblockIp(${u.id},'${ipd.ip}')" class="text-green-400 hover:text-green-300 text-xs">✅ 解除</button>`
+        : `<button onclick="blockIp(${u.id},'${ipd.ip}')" class="text-red-400 hover:text-red-300 text-xs">🚫 拉黑此IP</button>`;
+
+      return `<tr class="ip-subrow hidden bg-slate-900 border-b border-slate-800" data-user="${u.id}">
+        <td colspan="2" class="pl-10 py-2 font-mono text-xs text-slate-300">↳ ${ipd.ip}</td>
+        <td class="py-2 text-xs">${statusHtml}</td>
+        <td class="py-2 text-xs">${timeHtml}</td>
+        <td colspan="2" class="py-2"></td>
+        <td class="py-2 pr-4 text-right">${actionHtml}</td>
+      </tr>`;
     });
+
+    return `<tr class="table-row border-b border-dark-700 last:border-0">
+      <td class="px-4 py-3">
+        ${onlineDot}<span class="font-medium text-white">${escHtml(u.remark) || '<span class="text-slate-500">未命名</span>'}</span>
+        ${u.note ? `<p class="text-xs text-slate-500 truncate max-w-xs mt-0.5">${escHtml(u.note)}</p>` : ''}
+      </td>
+      <td class="px-4 py-3 font-mono text-slate-400 text-xs">
+        <span title="${u.uuid}">${uuidShort}</span>
+        <button onclick="copyText('${u.uuid}')" class="ml-1 text-slate-500 hover:text-blue-400 text-xs" title="复制 UUID">📋</button>
+      </td>
+      <td class="px-4 py-3">${statusBadge}</td>
+      <td class="px-4 py-3 text-xs">${deviceHtml}</td>
+      <td class="px-4 py-3 text-xs">${expiryHtml}</td>
+      <td class="px-4 py-3">${trafficHtml}</td>
+      <td class="px-4 py-3">
+        <div class="flex items-center justify-end gap-3">
+          ${blockBtn}
+          <button onclick="openEditModal(${u.id})" class="text-slate-400 hover:text-white text-xs transition-colors" title="编辑">✏️</button>
+          <button onclick="getLink(${u.id})" class="text-slate-400 hover:text-blue-400 text-xs transition-colors" title="获取链接">🔗</button>
+          ${trafficLimit ? `<button onclick="resetTraffic(${u.id})" class="text-slate-400 hover:text-yellow-400 text-xs transition-colors" title="重置流量">↺</button>` : ''}
+          <button onclick="deleteUser(${u.id})" class="text-slate-500 hover:text-red-400 text-xs transition-colors" title="删除">🗑️</button>
+        </div>
+      </td>
+    </tr>
+    ${allIpRows.join('')}`;
+  }).join('');
+}
+
+/* ─────────────────────────── User actions ──────────────────── */
+
+function getDurationValue(selectId, customId) {
+  const sel = document.getElementById(selectId).value;
+  if (sel === 'custom') return parseInt(document.getElementById(customId).value) || 30;
+  return parseInt(sel);
+}
+
+function bindDurationSelect(selectId, customId) {
+  document.getElementById(selectId).onchange = function() {
+    document.getElementById(customId).classList.toggle('hidden', this.value !== 'custom');
+  };
+}
+
+function openAddModal() {
+  document.getElementById('addRemark').value   = '';
+  document.getElementById('addTraffic').value  = '0';
+  document.getElementById('addDuration').value = '30';
+  document.getElementById('addMaxIps').value   = '1';
+  document.getElementById('addCustomDays').classList.add('hidden');
+  bindDurationSelect('addDuration', 'addCustomDays');
+  document.getElementById('addModal').classList.remove('hidden');
+}
+
+async function doAddUser() {
+  const remark        = document.getElementById('addRemark').value.trim();
+  const traffic_limit = parseInt(document.getElementById('addTraffic').value) || 0;
+  const duration      = getDurationValue('addDuration', 'addCustomDays');
+  const max_ips       = parseInt(document.getElementById('addMaxIps').value);
+  try {
+    await api('POST', '/api/users', { remark, traffic_limit, duration, max_ips });
+    closeModal('addModal');
+    toast('用户已创建并激活', 'success');
+    await loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function openEditModal(id) {
+  const u = allUsers.find(x => x.id === id);
+  if (!u) return;
+  document.getElementById('editId').value        = id;
+  document.getElementById('editRemark').value    = u.remark || '';
+  document.getElementById('editTraffic').value   = u.traffic_limit || 0;
+  document.getElementById('editMaxIps').value    = String(u.max_ips ?? 1);
+  document.getElementById('editNote').value      = u.note || '';
+
+  // Show current traffic usage
+  const trafficEl = document.getElementById('editCurrentTraffic');
+  if (u.traffic_limit) {
+    const usedGB = (u.traffic_used / 1073741824).toFixed(2);
+    trafficEl.textContent = `已用：${usedGB} GB / ${u.traffic_limit} GB`;
   } else {
-    http.createServer(app).listen(port, () => {
-      console.log(`\n✅ 管理后台已启动 (HTTP)`);
-      console.log(`🔗 http://${cfg.serverIp}:${port}${BASE}\n`);
-    });
+    trafficEl.textContent = '当前：不限流量';
   }
+  document.getElementById('editDuration').value = '-1';
+  document.getElementById('editCustomDays').classList.add('hidden');
+  bindDurationSelect('editDuration', 'editCustomDays');
+
+  // Show current expiry
+  const expiryEl = document.getElementById('editCurrentExpiry');
+  if (u.expires_at) {
+    const days = Math.ceil((new Date(u.expires_at) - new Date()) / 86400000);
+    expiryEl.textContent = days < 0
+      ? `当前：已过期（${new Date(u.expires_at).toLocaleDateString('zh-CN')}）`
+      : `当前：还剩 ${days} 天（${new Date(u.expires_at).toLocaleDateString('zh-CN')} 到期）`;
+  } else {
+    expiryEl.textContent = '当前：永久';
+  }
+
+  document.getElementById('editModal').classList.remove('hidden');
 }
 
-if (process.argv.includes('--setup-only')) {
-  (async () => {
-    await setupWizard();
-    process.exit(0);
-  })().catch(e => { console.error(e.message); process.exit(1); });
-} else {
-  main().catch(e => { console.error('启动失败:', e.message); process.exit(1); });
+async function doEditUser() {
+  const id            = document.getElementById('editId').value;
+  const remark        = document.getElementById('editRemark').value.trim();
+  const traffic_limit = parseInt(document.getElementById('editTraffic').value) || 0;
+  const max_ips       = parseInt(document.getElementById('editMaxIps').value);
+  const note          = document.getElementById('editNote').value.trim();
+  const duration      = getDurationValue('editDuration', 'editCustomDays');
+  try {
+    await api('PUT', `/api/users/${id}`, { remark, note, traffic_limit, max_ips, duration });
+    closeModal('editModal');
+    toast('已保存', 'success');
+    await loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
 }
+
+
+/* ── IP fold / unfold ── */
+function toggleIps(userId) {
+  document.querySelectorAll(`.ip-subrow[data-user="${userId}"]`).forEach(row => {
+    row.classList.toggle('hidden');
+  });
+}
+
+async function blockIp(userId, ip) {
+  try {
+    await api('POST', `/api/users/${userId}/block-ip`, { ip });
+    toast(`已拉黑 IP ${ip}`, 'success');
+    await loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function unblockIp(userId, ip) {
+  try {
+    await api('POST', `/api/users/${userId}/unblock-ip`, { ip });
+    toast(`已解除 IP ${ip}`, 'success');
+    await loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function syncFromXray() {
+  try {
+    toast('正在从 Xray 读取用户...', 'info');
+    const d = await api('POST', '/api/sync-xray');
+    toast(`同步完成：新导入 ${d.imported} 个，更新别名 ${d.updated} 个，已跳过 ${d.skipped} 个`, 'success');
+    await loadUsers();
+  } catch (e) { toast('同步失败: ' + e.message, 'error'); }
+}
+
+function blockUser(id) {
+  const u = allUsers.find(x => x.id === id);
+  const name = u?.remark || u?.uuid?.slice(0, 8) || id;
+  confirm2(`确认拉黑「${name}」？`, '该用户将立即断线，无法继续连接。', async () => {
+    try {
+      await api('POST', `/api/users/${id}/block`);
+      toast('已拉黑，Xray 已重载', 'success');
+      await loadUsers();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+
+async function resetTraffic(id) {
+  const u = allUsers.find(x => x.id === id);
+  const name = u?.remark || u?.uuid?.slice(0, 8) || id;
+  confirm2(`重置「${name}」的流量计数？`, '已用流量清零，不影响其他设置。', async () => {
+    try {
+      await api('POST', `/api/users/${id}/reset-traffic`);
+      toast('流量已重置', 'success');
+      await loadUsers();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+
+async function unblockUser(id) {
+  try {
+    await api('POST', `/api/users/${id}/unblock`);
+    toast('已解除拉黑', 'success');
+    await loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function deleteUser(id) {
+  const u = allUsers.find(x => x.id === id);
+  const name = u?.remark || u?.uuid?.slice(0, 8) || id;
+  confirm2(`确认删除「${name}」？`, '此操作不可恢复，将同时从 Xray 配置中移除。', async () => {
+    try {
+      await api('DELETE', `/api/users/${id}`);
+      toast('已删除', 'success');
+      await loadUsers();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+
+async function getLink(id) {
+  try {
+    const d = await api('GET', `/api/users/${id}/link`);
+    document.getElementById('linkText').value = d.link || '无法生成链接，请检查 Xray 配置';
+    document.getElementById('copyOk').classList.add('hidden');
+    document.getElementById('linkModal').classList.remove('hidden');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function copyLink() {
+  const txt = document.getElementById('linkText').value;
+  copyText(txt);
+  document.getElementById('copyOk').classList.remove('hidden');
+}
+
+/* ─────────────────────────── Settings ──────────────────────── */
+async function loadSettings() {
+  try {
+    const d = await api('GET', '/api/settings');
+    document.getElementById('setIp').value = d.serverIp || '';
+  } catch {}
+}
+
+async function saveSettings() {
+  const serverIp  = document.getElementById('setIp').value.trim();
+  const newPwd    = document.getElementById('setNewPwd').value.trim();
+  const body = {};
+  if (serverIp) body.serverIp = serverIp;
+  if (newPwd)   body.newPassword = newPwd;
+  try {
+    await api('PUT', '/api/settings', body);
+    const msg = document.getElementById('settingsMsg');
+    msg.classList.remove('hidden');
+    setTimeout(() => msg.classList.add('hidden'), 3000);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* ─────────────────────────── Helpers ───────────────────────── */
+function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+
+function confirm2(title, msg, cb) {
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmMsg').textContent   = msg;
+  document.getElementById('confirmOkBtn').onclick = () => { closeModal('confirmModal'); cb(); };
+  document.getElementById('confirmModal').classList.remove('hidden');
+}
+
+function copyText(txt) {
+  navigator.clipboard?.writeText(txt).catch(() => {
+    const ta = document.createElement('textarea');
+    ta.value = txt; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta);
+  });
+}
+
+let toastTimer;
+function toast(msg, type = 'info') {
+  const el    = document.getElementById('toast');
+  const inner = document.getElementById('toastInner');
+  const colors = { success:'bg-green-700 text-white', error:'bg-red-700 text-white', info:'bg-slate-700 text-white' };
+  inner.className = `px-5 py-3 rounded-xl text-sm font-medium shadow-xl ${colors[type] || colors.info}`;
+  inner.textContent = msg;
+  el.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 3000);
+}
+
+function timeAgo(isoStr) {
+  if (!isoStr) return '—';
+  const diff = Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000);
+  if (diff < 60)   return `${diff}秒前`;
+  if (diff < 3600) return `${Math.floor(diff/60)}分钟前`;
+  if (diff < 86400) return `${Math.floor(diff/3600)}小时前`;
+  return `${Math.floor(diff/86400)}天前`;
+}
+
+function escHtml(s) {
+  return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ─────────────────────────── Boot ──────────────────────────── */
+if (TOKEN) {
+  // Try auto-login with stored token
+  api('GET', '/api/users').then(() => showApp()).catch(() => { TOKEN = ''; localStorage.removeItem('xa_token'); });
+}
+
+// Close modal on backdrop click
+document.querySelectorAll('.modal-bg').forEach(el => {
+  el.addEventListener('click', e => { if (e.target === el) el.classList.add('hidden'); });
+});
+</script>
+</body>
+</html>
