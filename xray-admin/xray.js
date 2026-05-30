@@ -275,10 +275,60 @@ function buildVlessLink(uuid, remark, cfg, serverIp) {
   return `vless://${uuid}@${serverIp}:${port}?${params.toString()}#${tag}`;
 }
 
+/* ─── IP-level blocking via Xray routing rules ───────── */
+
+const IP_BLOCK_TAG = 'xray-admin-ip-block';
+
+// Ensure the blackhole outbound for IP blocking exists
+function ensureIpBlockOutbound(cfg) {
+  cfg.outbounds = cfg.outbounds || [];
+  if (!cfg.outbounds.find(o => o.tag === IP_BLOCK_TAG)) {
+    cfg.outbounds.push({ tag: IP_BLOCK_TAG, protocol: 'blackhole' });
+  }
+}
+
+// Get the list of IPs currently blocked via routing rules
+function getBlockedSourceIps(cfg) {
+  const rule = (cfg.routing?.rules || []).find(r => r.outboundTag === IP_BLOCK_TAG);
+  return rule ? [...(rule.source || [])] : [];
+}
+
+// Overwrite the blocked-IP routing rule with a new list
+function setBlockedSourceIps(cfg, ips) {
+  ensureIpBlockOutbound(cfg);
+  cfg.routing        = cfg.routing        || {};
+  cfg.routing.rules  = cfg.routing.rules  || [];
+
+  // Remove any existing managed rule
+  cfg.routing.rules = cfg.routing.rules.filter(r => r.outboundTag !== IP_BLOCK_TAG);
+
+  if (ips.length > 0) {
+    // Insert as first rule (highest priority)
+    cfg.routing.rules.unshift({
+      type:        'field',
+      source:      ips,
+      outboundTag: IP_BLOCK_TAG,
+    });
+  }
+}
+
+// Add one IP to the block list
+function blockSourceIp(cfg, ip) {
+  const current = getBlockedSourceIps(cfg);
+  if (!current.includes(ip)) setBlockedSourceIps(cfg, [...current, ip]);
+}
+
+// Remove one IP from the block list
+function unblockSourceIp(cfg, ip) {
+  const current = getBlockedSourceIps(cfg).filter(x => x !== ip);
+  setBlockedSourceIps(cfg, current);
+}
+
 module.exports = {
   readConfig, writeConfig, reloadXray,
   addClient, removeClient, updateClientEmail,
   getClients,
+  blockSourceIp, unblockSourceIp, getBlockedSourceIps, setBlockedSourceIps,
   enableStats, queryTrafficStats,
   getOnlineEmails, buildVlessLink,
   XRAY_CONFIG,
