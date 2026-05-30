@@ -92,6 +92,13 @@ if [[ ! -f "${INSTALL_DIR}/admin.config.json" ]]; then
   exit 1
 fi
 
+# ─── 放行管理后台端口 ─────────────────────────
+ADMIN_PORT=$(python3 -c "import json;c=json.load(open('${INSTALL_DIR}/admin.config.json'));print(c.get('port',''))" 2>/dev/null)
+if [[ -n "$ADMIN_PORT" ]] && command -v ufw &>/dev/null; then
+  ufw allow ${ADMIN_PORT}/tcp &>/dev/null
+  info "已放行端口 ${ADMIN_PORT}/tcp"
+fi
+
 # ─── 创建 systemd 服务 ────────────────────────
 step "配置开机自启"
 cat > "$SERVICE_FILE" <<EOF
